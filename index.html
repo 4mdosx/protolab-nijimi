@@ -54,8 +54,7 @@
   <header>
     <h1>nijimi <em>·</em> 滲み <em>·</em> 编辑器</h1>
     <p>
-      nijimi（滲み），字面是「墨在纸上洇开」。轻量级 diorama 渲染引擎的四个生产工具，标定值回写引擎本体（<b>src/*</b>）。
-      人物 = 单模型；姿势/动画 = 角色动作库；场景 = 纯环境；集成 = 内容包 × 角色融合。
+      人物 = 单模型；姿势/动画 = 角色动作库；场景 = 纯环境；集成 = 内容包 × 角色融合；着色器 = 层 B 材质的实时编辑；演出 = 效果时间线。
       消费方（游戏侧）直接 import 同一套引擎，读到的就是这里看到的东西。
     </p>
   </header>
@@ -86,6 +85,18 @@
       <h3>集成编辑器</h3>
       <p>完整场景 + 人物的融合调试：人物朝向 / 站位微调 + 全套灯光后期滑杆。内容包 × 角色 × 后期全链调试，标定值回写 stage.ts / character.ts。</p>
       <div class="path">/editors/integrated.html</div>
+    </a>
+    <a class="card" href="/editors/shader.html">
+      <div class="no">05 · SHADER</div>
+      <h3>GLSL 工作台</h3>
+      <p>层 B（defineMaterial）的实时着色器编辑台：参数表自动长滑杆、uniform 声明自动生成、⌘↵ 热编译、编译错误接住并显示。法阵 / 能量体两个样例。</p>
+      <div class="path">/editors/shader.html</div>
+    </a>
+    <a class="card" href="/editors/effects.html">
+      <div class="no">06 · EFFECTS</div>
+      <h3>演出编辑器</h3>
+      <p>关键帧时间线编一段角色演出：多轨道曲线、拖点加点、scrub 定位、冲击波开关。播放走真实 effects 调度，导出可直接落库的 EffectSpec 代码。</p>
+      <div class="path">/editors/effects.html</div>
     </a>
   </div>
 

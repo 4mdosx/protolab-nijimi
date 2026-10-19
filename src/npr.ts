@@ -8,7 +8,9 @@
  *   2. NPR 材质注入：柔和 ramp（不出现锐利半影）、冷暖撞色（暗部染色）、
  *      视角高光（高光方向随相机）、随相机边缘光（rim，颜色可换）。
  *   3. 彩色 IBL：程序化等距柱状渐变 → PMREM，给 PBR 件（黄铜/金属）带颜色的间接光。
- *   4. 反向 hull 描边：MeshBasicMaterial + onBeforeCompile 沿法线外扩，蒙皮自动兼容。
+ *   4. 反向 hull 描边材质：MeshBasicMaterial + onBeforeCompile 沿法线外扩，蒙皮自动兼容。
+ *      （只到「材质」这一层：对象级的 addOutlineToObject / 阴影代理 / 相机锁定 rig
+ *       在 2026-10-17 核对时是零调用，P2 直接删掉，见 docs/渲染管线-*.md §5.3-⑱）
  *   5. PBR / NPR 分区：契约版资产按 `extras.charter.role` 查表定轨道
  *      （终末地 Hybrid NPR：面/发/布 NPR、身体与装甲 PBR）；无契约的资产
  *      （房间程序化材质、CC0 通用模型）退回材质名正则兜底。
@@ -21,6 +23,13 @@
 import * as THREE from 'three';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { materialCharter, TRACK_OF_ROLE, type CharterRole } from './charter';
+import { resolveModules } from './shader/module';
+import { extendMaterial } from './shader/material';
+import { NPR_MODULES } from './shader/modules/npr';
+import type { ShaderModule } from './shader/module';
+import { createParamBus, type ParamBus, type ParamValue } from './shader/params';
+import type { ParamType } from './shader/module';
+import type { NoticeSink } from './notice';
 
 /* ------------------------------------------------------------------ *
  * 1. NPR 光照参数（共享 uniform 容器）
@@ -62,217 +71,115 @@ export interface NprUniforms {
   uNprSdfDebug: THREE.IUniform<number>;
 }
 
-export function createNprUniforms(): NprUniforms {
-  return {
-    uNprKeyDir: { value: new THREE.Vector3(-0.4, 0.8, 0.45).normalize() },
-    uNprKeyColor: { value: new THREE.Color(0xfff0dd) },
-    uNprRampLow: { value: 0.5 },
-    uNprRampSoft: { value: 0.34 },
-    uNprShadowTint: { value: new THREE.Color(0x7d84c8) }, // 冷紫（与房间 hemi 同源）
-    uNprLightTint: { value: new THREE.Color(0xfff1d8) },  // 暖白
-    uNprTintStrength: { value: 0.5 },
-    uNprSpecViewMix: { value: 0.7 },
-    uNprSpecStrength: { value: 0.22 },
-    uNprSpecPower: { value: 28 },
-    uNprSpecColor: { value: new THREE.Color(0xfff4e2) },
-    uNprRimColor: { value: new THREE.Color(0xffc890) },
-    uNprRimStrength: { value: 0.3 },
-    uNprRimPower: { value: 3.2 },
-    uNprEnable: { value: 1 },
-    uNprCamPos: { value: new THREE.Vector3() },
-    uNprSdfOn: { value: 0 },
-    uNprSdfDebug: { value: 0 },
-  };
+/**
+ * 建 NPR 的共享 uniform 容器。
+ *
+ * 传 `bus` 时会把每个 uniform **接管**进参数总线（不克隆、返回同一对象）：
+ * 于是「材质注入时按 id 找 uniform」和「编辑器直接改 nprUniforms.uNprRimStrength.value」
+ * 操作的是同一个 IUniform。不传就自己建一条总线——编辑器/测试沿旧用法即可。
+ */
+export function createNprUniforms(bus: ParamBus = createParamBus()): NprUniforms {
+  const declare = (id: string, value: ParamValue) => bus.adopt(id, { value }, NPR_PARAM_TYPES[id]);
+  const u = {
+    uNprKeyDir: declare('uNprKeyDir', new THREE.Vector3(-0.4, 0.8, 0.45).normalize()),
+    uNprKeyColor: declare('uNprKeyColor', new THREE.Color(0xfff0dd)),
+    uNprRampLow: declare('uNprRampLow', 0.5),
+    uNprRampSoft: declare('uNprRampSoft', 0.34),
+    uNprShadowTint: declare('uNprShadowTint', new THREE.Color(0x7d84c8)), // 冷紫（与房间 hemi 同源）
+    uNprLightTint: declare('uNprLightTint', new THREE.Color(0xfff1d8)),  // 暖白
+    uNprTintStrength: declare('uNprTintStrength', 0.5),
+    uNprSpecViewMix: declare('uNprSpecViewMix', 0.7),
+    uNprSpecStrength: declare('uNprSpecStrength', 0.22),
+    uNprSpecPower: declare('uNprSpecPower', 28),
+    uNprSpecColor: declare('uNprSpecColor', new THREE.Color(0xfff4e2)),
+    uNprRimColor: declare('uNprRimColor', new THREE.Color(0xffc890)),
+    uNprRimStrength: declare('uNprRimStrength', 0.3),
+    uNprRimPower: declare('uNprRimPower', 3.2),
+    uNprEnable: declare('uNprEnable', 1),
+    uNprCamPos: declare('uNprCamPos', new THREE.Vector3()),
+    uNprSdfOn: declare('uNprSdfOn', 0),
+    uNprSdfDebug: declare('uNprSdfDebug', 0),
+  } as unknown as NprUniforms;
+  (u as NprUniforms & NprWithBus)[NPR_BUS] = bus;
+  return u;
 }
 
-/** 把 NprUniforms 拆成 shader.uniforms 的补充表（保持对象引用，共享更新） */
-function asShaderUniforms(u: NprUniforms): Record<string, THREE.IUniform> {
-  return { ...u } as unknown as Record<string, THREE.IUniform>;
+/** 共享 uniform → 参数总线的桥（NprUniforms 上挂了自己的总线，模块注入时按 id 解析） */
+const NPR_BUS = Symbol('nijimi.npr.bus');
+type NprWithBus = { [NPR_BUS]?: ParamBus };
+
+/** NprUniforms 里每个 uniform 的 GLSL 类型（注入时自动生成声明用） */
+const NPR_PARAM_TYPES: Record<string, ParamType> = {
+  uNprKeyDir: 'vec3',
+  uNprKeyColor: 'color',
+  uNprRampLow: 'float',
+  uNprRampSoft: 'float',
+  uNprShadowTint: 'color',
+  uNprLightTint: 'color',
+  uNprTintStrength: 'float',
+  uNprSpecViewMix: 'float',
+  uNprSpecStrength: 'float',
+  uNprSpecPower: 'float',
+  uNprSpecColor: 'color',
+  uNprRimColor: 'color',
+  uNprRimStrength: 'float',
+  uNprRimPower: 'float',
+  uNprEnable: 'float',
+  uNprCamPos: 'vec3',
+  uNprSdfOn: 'float',
+  uNprSdfDebug: 'float',
+};
+
+/** 取这批 uniform 归属的参数总线（编辑器自己 new 的 NprUniforms 也能用） */
+export function nprBusOf(u: NprUniforms): ParamBus {
+  const own = (u as NprUniforms & NprWithBus)[NPR_BUS];
+  if (own) return own;
+  // 兼容旧路径（有人手工拼了一个 NprUniforms 对象）：现场补一个总线并接管这些 uniform，
+  // 只接管一次——之后所有模块拿到的都是同一批对象。
+  const bus = createParamBus();
+  for (const [id, uniform] of Object.entries(u)) {
+    bus.adopt(id, uniform as THREE.IUniform, NPR_PARAM_TYPES[id]);
+  }
+  (u as NprUniforms & NprWithBus)[NPR_BUS] = bus;
+  return bus;
 }
 
 /* ------------------------------------------------------------------ *
- * 2. 材质注入
+ * 2. 材质注入（模块化）
  * ------------------------------------------------------------------ */
 
-const NPR_VERT_HEAD = /* glsl */ `
-varying vec3 vNprWNormal;
-varying vec3 vNprWPos;
-varying vec3 vNprFwd;
-varying vec3 vNprLeft;
-// 自建 UV varying：r152 起 three 只在 USE_UV / USE_ANISOTROPY 下声明 vUv，
-// 而 r186 的 WebGLProgram 从不定义 USE_UV（USE_MAP 只给 vMapUv）——直接引用
-// vUv 会「未声明标识符」编译失败，把整个注入体连同调试分支一起废掉。
-// 这里用标准 uv 属性自己传一份（attribute vec2 uv 是无条件声明的）。
-varying vec2 vNprUv;
-`;
-
-const NPR_VERT_BODY = /* glsl */ `
-	vNprWPos = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;
-	vNprWNormal = normalize( mat3( modelMatrix ) * objectNormal );
-	vNprFwd = normalize( mat3( modelMatrix ) * vec3( 0.0, 0.0, -1.0 ) );
-	vNprLeft = normalize( mat3( modelMatrix ) * vec3( -1.0, 0.0, 0.0 ) );
-	vNprUv = uv;
-`;
-
-const NPR_FRAG_HEAD = /* glsl */ `
-uniform vec3 uNprKeyDir;
-uniform vec3 uNprKeyColor;
-uniform float uNprRampLow;
-uniform float uNprRampSoft;
-uniform vec3 uNprShadowTint;
-uniform vec3 uNprLightTint;
-uniform float uNprTintStrength;
-uniform float uNprSpecViewMix;
-uniform float uNprSpecStrength;
-uniform float uNprSpecPower;
-uniform vec3 uNprSpecColor;
-uniform vec3 uNprRimColor;
-uniform float uNprRimStrength;
-uniform float uNprRimPower;
-uniform float uNprEnable;
-uniform vec3 uNprCamPos;
-uniform float uNprSdfOn;
-uniform float uNprSdfDebug;
-uniform sampler2D uNprSdfMap;
-varying vec3 vNprWNormal;
-varying vec3 vNprWPos;
-varying vec3 vNprFwd;
-varying vec3 vNprLeft;
-varying vec2 vNprUv;
-
-// 保亮度的染色：只偏移色相 / 饱和度，不改变明度（冷暖撞色不能顺手把画面压暗）
-vec3 nprTintKeepLuma( vec3 c, vec3 tint ) {
-	float l0 = dot( c, vec3( 0.2126, 0.7152, 0.0722 ) );
-	vec3 t = c * tint;
-	float l1 = max( dot( t, vec3( 0.2126, 0.7152, 0.0722 ) ), 1e-4 );
-	return t * ( l0 / l1 );
+/** 注入用的模块集 = 内建 NPR 表面 + 内容侧追加的模块（顺序由 after/before 决定） */
+function modulesFor(extra: readonly ShaderModule[]): readonly ShaderModule[] {
+  return extra.length > 0 ? [...NPR_MODULES, ...extra] : NPR_MODULES;
 }
-`;
+
+export interface InjectNprOptions {
+  /** 内容侧追加的模块（层 A 的扩展点） */
+  modules?: readonly ShaderModule[];
+  /** 材质级 uniform（如各自的 SDF 贴图），优先级高于总线 */
+  extra?: Record<string, THREE.IUniform>;
+  /** 变体键里的轨道名，只影响缓存分组 */
+  tag?: string;
+  notices?: NoticeSink;
+}
 
 /**
- * 注入主体。挂在 `#include <opaque_fragment>` 之前——此处 `outgoingLight` 与
- * `diffuseColor` 都已在作用域内，且 MeshStandardMaterial / MeshToonMaterial 同构，
- * 一份代码两条材质轨道通吃。
+ * 把一个材质打上 NPR 表面（幂等）。
  *
- * 顺序：ramp 收敛（柔和明暗阶跃） → 冷暖撞色 → 视角高光 → 边缘光。
+ * 以前这里是一整段字符串常量 + `Math.random()` 的 cache key：每个材质一个 program。
+ * 现在拆成模块（basis/sdf/ramp/tint/spec/rim/debug/commit），cache key = 模块签名，
+ * 同族材质共享 program；内容侧只要往 `modules` 里追加自己的模块就能加效果。
  */
-const NPR_FRAG_BODY = /* glsl */ `
-	if ( uNprEnable > 0.5 ) {
-		vec3 nprN = normalize( vNprWNormal );
-		vec3 nprV = normalize( uNprCamPos - vNprWPos );
-		vec3 nprL = normalize( uNprKeyDir );
-
-		// --- 明暗驱动 ---
-		// 默认：柔和 ramp（smoothstep 重写 NdotL 过渡，抹掉锐利半影分割）。
-		// face 专项：改用 SDF 阈值场驱动（终末地脸部阴影的正主），见下。
-		float nprDriver = smoothstep( 0.5 - uNprRampSoft, 0.5 + uNprRampSoft, dot( nprN, nprL ) * 0.5 + 0.5 );
-
-		// 面部 SDF：lightAtten = 光从正面(0)到背面(1)的水平进度；
-		// R/G = 左右两个半球的阴影阈值场（美术烘的「光到哪个角度这块开始变暗」）。
-		// 终末地柔化：edge0 = max(2a-1, 0), edge1 = min(2a, 1) ——
-		// 正面(a=0)→RampU=1，侧面(a=0.5)→RampU=阈值本身，背面(a=1)→RampU=0，
-		// 脸部光照随光源后移「慢慢软下来」而不是硬二分。
-		// A 通道黑 = 鼻尖 mask：光到侧后方时鼻尖投影加深。
-		float nprAtten = 1.0 - ( dot( nprL, normalize( vNprFwd ) ) * 0.5 + 0.5 );
-		float nprThr = 0.0;
-		#ifdef NPR_IS_FACE
-		// 注意：这里不做 uNprSdfDebug 门控——调试模式也要把 nprDriver 算成 SDF 驱动，
-		// 否则 dbg=2（最终明暗）显示的是默认 ramp 驱动，标定时会自欺。
-		if ( uNprSdfOn > 0.5 ) {
-			vec4 nprSdf = texture2D( uNprSdfMap, vNprUv );
-			float nprSide = dot( nprL, normalize( vNprLeft ) );
-			nprThr = nprSide > 0.0 ? nprSdf.r : nprSdf.g;
-			float nprE0 = max( 2.0 * nprAtten - 1.0, 0.0 );
-			float nprE1 = min( 2.0 * nprAtten, 1.0 );
-			float nprLit = smoothstep( nprE0, nprE1, nprThr );
-			float nprNose = ( 1.0 - nprSdf.a ) * smoothstep( 0.45, 0.75, nprAtten );
-			nprDriver = nprLit * ( 1.0 - nprNose * 0.55 );
-		}
-		#endif
-
-		float nprShade = mix( uNprRampLow, 1.0, nprDriver );
-
-		// [工程推断] 只对「直射光」做风格化，环境/IBL 全额保留——对应拆解里
-		// 「场景光源提供整体明暗与色彩氛围，角色光独立」的分工。
-		// 若把环境光一起乘进 ramp，暗部会被二次压黑（实测：整身发灰发闷）。
-		vec3 nprIndirect = reflectedLight.indirectDiffuse + reflectedLight.indirectSpecular;
-		// PBR 轨道（金属/装甲）只 ramp 漫反射：GGX 高光是金属质感的本体，
-		// 乘上 ramp 会把高光带一起压没（实测：黄铜件整根发黑）。
-		#ifdef NPR_IS_PBR
-			vec3 nprDirect = reflectedLight.directDiffuse * nprShade * uNprKeyColor + reflectedLight.directSpecular;
-		#else
-			vec3 nprDirect = ( reflectedLight.directDiffuse + reflectedLight.directSpecular ) * nprShade * uNprKeyColor;
-		#endif
-
-		// 自发光处理：face 的弱自发光随 SDF 明暗一起衰减（不然阴影区被自发光填平，
-		// SDF 白烘）；其余轨道全额保留（glow 加法件「黑=不贡献」，不该被压）。
-		#ifdef NPR_IS_FACE
-			vec3 nprEmisTerm = totalEmissiveRadiance * mix( 0.35, 1.0, nprDriver );
-		#else
-			vec3 nprEmisTerm = totalEmissiveRadiance;
-		#endif
-		vec3 nprOut = nprIndirect + nprDirect + nprEmisTerm;
-
-		// --- 冷暖撞色：暗部往冷端偏、亮部往暖端偏，保亮度 ---
-		vec3 nprTint = mix( uNprShadowTint, uNprLightTint, nprDriver );
-		vec3 nprTinted = nprTintKeepLuma( nprOut, nprTint );
-		nprOut = mix( nprOut, nprTinted, uNprTintStrength );
-
-		// --- 视角高光：高光方向 = 主光方向与相机方向的混合 ---
-		// [公开拆解] 「服装和头发的高光方向会始终跟随摄像机视角，如同一个虚拟补光灯」
-		vec3 nprH = normalize( mix( nprL, nprV, uNprSpecViewMix ) );
-		float nprSpec = pow( clamp( dot( nprN, nprH ), 0.0, 1.0 ), max( uNprSpecPower, 1.0 ) );
-		nprOut += uNprSpecColor * nprSpec * uNprSpecStrength;
-
-		// --- 随相机边缘光：Fresnel 型 ---
-		// [公开拆解] 「剧情过场中会根据场景色调应用不同颜色的边缘光，如红色或蓝色」
-		float nprFres = 1.0 - clamp( dot( nprN, nprV ), 0.0, 1.0 );
-		float nprRim = pow( nprFres, max( uNprRimPower, 0.5 ) );
-		nprOut += uNprRimColor * nprRim * uNprRimStrength;
-
-		// --- SDF 调试输出（标定侧别/方向用）：1=阈值场 2=最终明暗 3=光照衰减 ---
-		#ifdef NPR_IS_FACE
-		if ( uNprSdfOn > 0.5 && uNprSdfDebug > 0.5 ) {
-			nprOut = uNprSdfDebug < 1.5 ? vec3( nprThr )
-				: ( uNprSdfDebug < 2.5 ? vec3( nprDriver ) : vec3( nprAtten ) );
-		}
-		#endif
-
-		outgoingLight = nprOut;
-	}
-`;
-
-const nprCacheKeys = new WeakMap<THREE.Material, string>();
-
-/** 把一个材质打上注入（幂等）。extra = 材质级 uniform（如各自的 SDF 贴图）。返回是否被打了。 */
-function injectNpr(
-  mat: THREE.Material,
-  u: NprUniforms,
-  extra?: Record<string, THREE.IUniform>,
-): void {
-  if (nprCacheKeys.has(mat)) return;
-  const tag = `npr:${Math.random().toString(36).slice(2)}`;
-  nprCacheKeys.set(mat, tag);
-
-  const prev = mat.onBeforeCompile;
-  mat.onBeforeCompile = (shader, renderer) => {
-    if (prev) prev.call(mat, shader, renderer);
-    // 共享 uniform 先并入，材质级（extra）后覆盖——face 材质用自己的 SDF 贴图与开关
-    Object.assign(shader.uniforms, asShaderUniforms(u), extra ?? {});
-
-    // 注入点都落在 `#include <common>` 之后——three 的 precision 前缀在那之前，
-    // 自己往前加 varying 会在片元侧丢掉默认精度。
-    shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', `#include <common>\n${NPR_VERT_HEAD}`)
-      .replace('#include <worldpos_vertex>', `#include <worldpos_vertex>\n${NPR_VERT_BODY}`);
-
-    shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${NPR_FRAG_HEAD}`)
-      .replace('#include <opaque_fragment>', `${NPR_FRAG_BODY}\n\t#include <opaque_fragment>`);
-  };
-  mat.customProgramCacheKey = () => tag;
-  mat.needsUpdate = true;
+function injectNpr(mat: THREE.Material, u: NprUniforms, opts: InjectNprOptions = {}): string {
+  return extendMaterial(mat, modulesFor(opts.modules ?? []), {
+    base: 'standard',
+    params: nprBusOf(u),
+    extra: opts.extra,
+    tag: opts.tag,
+    notices: opts.notices,
+  });
 }
+
 
 /* ------------------------------------------------------------------ *
  * 3. PBR / NPR 分区
@@ -339,40 +246,6 @@ export function charterRoleOf(mat: THREE.Material | null | undefined): CharterRo
 }
 
 /* ------------------------------------------------------------------ *
- * 4. NPR ramp 贴图（柔和多段，替代硬 step）
- * ------------------------------------------------------------------ */
-
-/**
- * 生成 ramp 贴图。`bands` 为色阶数，`soft` ∈ [0,1] 控制段间过渡宽度：
- * soft=0 → 硬 cel；soft=1 → 近乎连续。终末地取 middle（拆解原文：「刻意避免锐利的半影分割」）。
- * 注：统一着色模型落地后运行期走 smoothstep 注入项，本函数保留给需要贴图 ramp 的场合。
- */
-export function makeRampTexture(bands = 4, soft = 0.55): THREE.DataTexture {
-  const W = 256;
-  const data = new Uint8Array(W * 4);
-  for (let i = 0; i < W; i++) {
-    const x = i / (W - 1);           // 0 = 全暗，1 = 全亮
-    const t = x * bands;
-    const f = t - Math.floor(t);
-    const edge = Math.max(0.001, soft * 0.5);
-    const local = THREE.MathUtils.smoothstep(f, 0.5 - edge, 0.5 + edge);
-    const v = (Math.floor(t) + local) / bands;
-    const shade = 0.42 + 0.58 * v;    // 暗部下限 0.42，避免死黑
-    data[i * 4 + 0] = Math.round(255 * shade);
-    data[i * 4 + 1] = Math.round(255 * shade);
-    data[i * 4 + 2] = Math.round(255 * shade);
-    data[i * 4 + 3] = 255;
-  }
-  const tex = new THREE.DataTexture(data, W, 1, THREE.RGBAFormat);
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapS = THREE.ClampToEdgeWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.needsUpdate = true;
-  return tex;
-}
-
-/* ------------------------------------------------------------------ *
  * 5. 材质转换
  * ------------------------------------------------------------------ */
 
@@ -392,6 +265,33 @@ export interface NprMaterialOptions {
    * 通道语义：R/G = 左/右半球阴影阈值场，A = 鼻尖 mask（黑=鼻尖）。
    */
   faceSdf?: THREE.Texture | null;
+  /**
+   * 内容侧追加的着色模块（层 A 扩展点）。会插进内建 NPR 模块链里，
+   * 顺序由模块自身的 after/before 决定（例如 rim-pulse 排在 npr-commit 之前）。
+   * 只对 NPR / PBR 轨道生效——unlit 与描边壳没有 NPR 表面，硬塞会编译失败。
+   */
+  modules?: readonly ShaderModule[];
+  /** 降级/冲突提示的出口（舞台会传自己的 sink） */
+  notices?: NoticeSink;
+}
+
+/** 内容侧模块 + 材质级契约模块（契约声明排在内建 NPR 之后） */
+function modulesForMaterial(
+  src: THREE.Material,
+  opts: NprMaterialOptions,
+): readonly ShaderModule[] {
+  const extra = opts.modules ?? [];
+  const ids = materialCharter(src)?.shader?.modules;
+  if (!ids || ids.length === 0) return extra;
+  const { modules, missing } = resolveModules(ids);
+  if (missing.length > 0) {
+    opts.notices?.warn(
+      'module-missing',
+      `材质「${src.name || '(未命名)'}」声明的着色模块未注册：${missing.join(', ')}。已跳过。`,
+      { id: missing[0], detail: { material: src.name, missing } },
+    );
+  }
+  return modules.length > 0 ? [...extra, ...modules] : extra;
 }
 
 /**
@@ -408,6 +308,8 @@ export function toNprMaterial(
 ): THREE.Material {
   const std = src as THREE.MeshStandardMaterial;
   const role = opts.role ?? roleOfMaterial(src);
+  // 材质级契约着色：id 解析不到不抛（资产与代码可能版本错位），降级 + 出声
+  const modules = modulesForMaterial(src, opts);
 
   if (role === 'outline') {
     // 自带描边壳（契约 role=outline，如异环「发轮廓线」）：转成反向 hull——
@@ -417,6 +319,7 @@ export function toNprMaterial(
       thickness: opts.outlineWidth ?? 0.008,
     });
     m.name = src.name;
+    m.userData = { ...src.userData, ...m.userData };
     return m;
   }
 
@@ -433,6 +336,9 @@ export function toNprMaterial(
       fog: false,
     });
     m.name = src.name;
+    m.userData = { ...src.userData, ...m.userData };
+    // 眼周叠层需与 NPR 面部混用：无 SDF 时通过 NPR_HAS_FACE_SDF
+    // 移除采样分支，避免留下未绑定的 SDF sampler 导致脸部贴图异常。
     return m;
   }
 
@@ -442,7 +348,11 @@ export function toNprMaterial(
     // 曾经的写法对整条 PBR 轨道统一 stylizeMetal，会把皮肤粗糙度钳到 0.62 发亮。
     if (opts.stylizeMetal !== false && charterRoleOf(src) === 'metal') stylizeMetal(std);
     (std as THREE.MeshStandardMaterial).defines = { NPR_IS_PBR: '' };
-    injectNpr(std, u);
+    injectNpr(std, u, {
+      modules,
+      notices: opts.notices,
+      tag: 'pbr',
+    });
     return std;
   }
 
@@ -471,11 +381,18 @@ export function toNprMaterial(
       depthWrite: std.depthWrite,
     });
     face.name = src.name;
-    face.defines = { NPR_IS_FACE: '' };
+    face.userData = { ...src.userData };
+    // 无 SDF 的材质不能留下未绑定的 sampler；运行期开关为 0 仍会保留活跃 uniform。
+    face.defines = { NPR_IS_FACE: '', NPR_HAS_FACE_SDF: '' };
     opts.faceSdf.colorSpace = THREE.NoColorSpace; // 数据贴图，不做 sRGB 解码
     injectNpr(face, u, {
-      uNprSdfMap: { value: opts.faceSdf },
-      uNprSdfOn: { value: 1 },
+      modules,
+      notices: opts.notices,
+      extra: {
+        uNprSdfMap: { value: opts.faceSdf },
+        uNprSdfOn: { value: 1 },
+      },
+      tag: 'face-sdf',
     });
     return face;
   }
@@ -498,8 +415,13 @@ export function toNprMaterial(
     depthWrite: std.depthWrite,
   });
   npr.name = src.name;
-  if (isFace) npr.defines = { NPR_IS_FACE: '' }; // 无 SDF 贴图：face 分支内 uNprSdfOn=0，按普通 NPR 走
-  injectNpr(npr, u);
+  npr.userData = { ...src.userData };
+  if (isFace) npr.defines = { NPR_IS_FACE: '' }; // 无 SDF：保留 face 语义，不编译 SDF 采样分支
+  injectNpr(npr, u, {
+    modules,
+    notices: opts.notices,
+    tag: isFace ? 'face' : 'npr',
+  });
   return npr;
 }
 
@@ -515,6 +437,15 @@ export function stylizeMetal(mat: THREE.MeshStandardMaterial): void {
   mat.envMapIntensity = 0.8;
 }
 
+/** 统一的角色网格阴影/裁剪策略；也供保留原材质的编辑器准备阶段调用。 */
+export function configureNprMesh(mesh: THREE.Mesh): void {
+  mesh.castShadow = true;
+  mesh.frustumCulled = false;
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+  // 面部由 SDF（或普通 NPR 回退）负责明暗，避免叠加刘海 shadow map。
+  mesh.receiveShadow = !mats.some((m) => charterRoleOf(m) === 'face');
+}
+
 /** 遍历一棵子树，按分区规则换材质。返回换了几个。 */
 export function applyNprToObject(
   root: THREE.Object3D,
@@ -525,13 +456,8 @@ export function applyNprToObject(
   root.traverse((o) => {
     const mesh = o as THREE.Mesh;
     if (!mesh.isMesh) return;
-    mesh.castShadow = true;
-    mesh.frustumCulled = false; // 蒙皮网格的包围盒不含骨骼位移
+    configureNprMesh(mesh);
     const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    // face 族不收 shadow map 实时阴影：SDF 是脸部阴影的唯一来源，
-    // 两份叠加会把刘海影烘成死黑（夜兰无发影贴片，双重阴影尤其明显）
-    const isFaceMesh = mats.some((m) => charterRoleOf(m) === 'face');
-    mesh.receiveShadow = !isFaceMesh;
     const next = mats.map((m) => toNprMaterial(m, u, opts));
     mesh.material = Array.isArray(mesh.material) ? next : next[0];
     n += next.length;
@@ -549,26 +475,6 @@ export interface OutlineOptions {
   thickness?: number;
 }
 
-/**
- * 蒙皮安全的替身网格：蒙皮网格的顶点在 bind 空间，直接 new Mesh 会渲染成 bind pose
- * （T-pose）——替身必须以 SkinnedMesh + 同一 skeleton + 同一 bindMatrix 建，
- * 并挂成源网格的子节点（继承同一 world matrix，避免双重变换）。
- */
-function makeTwinMesh(src: THREE.Mesh, material: THREE.Material): THREE.Mesh {
-  const skinned = (src as THREE.SkinnedMesh).isSkinnedMesh === true;
-  if (!skinned) {
-    const m = new THREE.Mesh(src.geometry, material);
-    m.frustumCulled = false;
-    return m;
-  }
-  const sm = src as THREE.SkinnedMesh;
-  const twin = new THREE.SkinnedMesh(src.geometry, material);
-  twin.bindMode = sm.bindMode;
-  twin.bind(sm.skeleton, sm.bindMatrix);
-  twin.frustumCulled = false;
-  return twin;
-}
-
 /** 沿法线外扩（外扩量在世界单位下恒定，正交相机即屏幕恒定粗细）。 */
 function expandAlongNormal(material: THREE.Material, u: { value: number }, outward: boolean, key: string): void {
   material.userData.outlineUniform = u; // 便于滑杆实时改粗细，不必重建
@@ -580,21 +486,6 @@ function expandAlongNormal(material: THREE.Material, u: { value: number }, outwa
     );
   };
   material.customProgramCacheKey = () => key;
-}
-
-/** 实时改描边粗细 / 阴影代理内缩量（遍历子树，找带 outlineUniform 的材质）。 */
-export function setOutlineThickness(root: THREE.Object3D, thickness: number): number {
-  let n = 0;
-  root.traverse((o) => {
-    const m = o as THREE.Mesh;
-    if (!m.isMesh) return;
-    const mats = Array.isArray(m.material) ? m.material : [m.material];
-    for (const mat of mats) {
-      const u = (mat as THREE.Material).userData.outlineUniform as { value: number } | undefined;
-      if (u) { u.value = thickness; n++; }
-    }
-  });
-  return n;
 }
 
 /**
@@ -612,171 +503,6 @@ export function makeOutlineMaterial(opts: OutlineOptions = {}): THREE.MeshBasicM
   });
   expandAlongNormal(mat, { value: opts.thickness ?? 0.006 }, true, 'npr-outline');
   return mat;
-}
-
-/** 给一个网格挂描边壳（共享几何，零额外内存）。返回壳对象，便于改粗细。 */
-export function addOutlineHull(mesh: THREE.Mesh, opts: OutlineOptions = {}): THREE.Mesh {
-  const hull = makeTwinMesh(mesh, makeOutlineMaterial(opts));
-  hull.name = `${mesh.name || 'mesh'}__outline`;
-  hull.castShadow = false;
-  hull.receiveShadow = false;
-  hull.renderOrder = -1;
-  mesh.add(hull);
-  return hull;
-}
-
-/** 给整棵子树挂描边（跳过自带描边壳与透明件）。 */
-export function addOutlineToObject(root: THREE.Object3D, opts: OutlineOptions = {}): number {
-  const targets: THREE.Mesh[] = [];
-  root.traverse((o) => {
-    const m = o as THREE.Mesh;
-    if (!m.isMesh) return;
-    const mat = m.material as THREE.Material;
-    if (mat && (mat as THREE.MeshBasicMaterial).isMeshBasicMaterial) return;
-    if (mat && roleOfMaterial(mat) === 'outline') return;
-    if (mat && mat.transparent) return; // 透明件外扩会糊
-    targets.push(m);
-  });
-  for (const m of targets) addOutlineHull(m, opts);
-  return targets.length;
-}
-
-/* ------------------------------------------------------------------ *
- * 7. 阴影代理
- * ------------------------------------------------------------------ */
-
-/**
- * [公开拆解] 「系统还使用了向内的阴影代理，虽然不完全符合物理真实，
- *  却极大地丰富了角色的结构层次。」
- * [工程推断] three.js 里我们把它落地为「沿法线内缩的隐形投影体」：
- *  原网格只收阴影不投阴影，克隆一份沿法线内缩 ε 的隐形壳专门投影——
- *  投出的阴影比物理真实更小更贴合剪影，读起来是「内阴影」而不是杂物投影。
- */
-export function addShadowProxy(mesh: THREE.Mesh, inset = 0.01): THREE.Mesh | null {
-  const mat = mesh.material as THREE.Material;
-  if (!mat || mat.transparent) return null;
-  const proxyMat = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
-  const proxy = makeTwinMesh(mesh, proxyMat);
-  proxy.name = `${mesh.name || 'mesh'}__shadowProxy`;
-  proxy.castShadow = true;
-  proxy.receiveShadow = false;
-  proxy.position.copy(mesh.position);
-  proxy.quaternion.copy(mesh.quaternion);
-  proxy.scale.copy(mesh.scale);
-  // 内缩必须打在**深度材质**上——three 投影时用 MeshDepthMaterial，改原材质无效
-  const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
-  expandAlongNormal(depthMat, { value: inset }, false, 'npr-shadow-proxy');
-  proxy.customDepthMaterial = depthMat;
-  mesh.castShadow = false;
-  (mesh.parent ?? mesh).add(proxy);
-  return proxy;
-}
-
-/** 给整棵子树挂阴影代理（跳过透明件与已有替身）。 */
-export function addShadowProxyToObject(root: THREE.Object3D, inset = 0.01): number {
-  const targets: THREE.Mesh[] = [];
-  root.traverse((o) => {
-    const m = o as THREE.Mesh;
-    if (!m.isMesh) return;
-    if ((m.material as THREE.Material as THREE.MeshBasicMaterial).isMeshBasicMaterial) return;
-    if (m.name.endsWith('__shadowProxy') || m.name.endsWith('__outline')) return;
-    if ((m.material as THREE.Material).transparent) return;
-    targets.push(m);
-  });
-  let n = 0;
-  for (const m of targets) if (addShadowProxy(m, inset)) n++;
-  return n;
-}
-
-/* ------------------------------------------------------------------ *
- * 8. 分离式相机锁定光照 rig
- * ------------------------------------------------------------------ */
-
-export interface CameraLockedRigOptions {
-  /** 主光相对相机的方位（相机局部系：x 右、y 上、z 朝后） */
-  keyOffset?: THREE.Vector3;
-  keyColor?: THREE.ColorRepresentation;
-  keyIntensity?: number;
-  rimColor?: THREE.ColorRepresentation;
-  rimIntensity?: number;
-  rimOffset?: THREE.Vector3;
-  /** 灯与目标的距离（方向光只看方向，距离只影响 shadow camera 摆放） */
-  distance?: number;
-  castShadow?: boolean;
-  shadowSpan?: number;
-  shadowMapSize?: number;
-}
-
-export interface CameraLockedRig {
-  key: THREE.DirectionalLight;
-  rim: THREE.DirectionalLight;
-  group: THREE.Group;
-  /** 每帧调用：把灯摆到「相机坐标系里的固定方位」 */
-  update(camera: THREE.Camera): void;
-}
-
-/**
- * [公开拆解] 「将角色光照从场景光源中独立出来，将主要光照方向强制校准为相机朝向，
- *  避免因场景光源位置不佳而产生的『阴阳脸』或杂乱阴影。场景光源主要起提供
- *  整体明暗变化和色彩氛围的作用。」
- *
- * 实现：每帧读相机世界矩阵，把灯放到相机局部系的固定偏移点上——相机不动，
- * 角色就是固定的经典三点光；相机绕角色转，角色永远被同一套光打亮。
- */
-export function createCameraLockedRig(opts: CameraLockedRigOptions = {}): CameraLockedRig {
-  const group = new THREE.Group();
-  group.name = 'npr-camera-rig';
-  const distance = opts.distance ?? 4;
-  const span = opts.shadowSpan ?? 4;
-
-  const key = new THREE.DirectionalLight(opts.keyColor ?? 0xfff0dd, opts.keyIntensity ?? 1.6);
-  key.name = 'npr-key';
-  const rim = new THREE.DirectionalLight(opts.rimColor ?? 0xffc890, opts.rimIntensity ?? 1.1);
-
-  if (opts.castShadow !== false) {
-    key.castShadow = true;
-    const s = opts.shadowMapSize ?? 2048;
-    key.shadow.mapSize.set(s, s);
-    key.shadow.camera.left = -span;
-    key.shadow.camera.right = span;
-    key.shadow.camera.top = span;
-    key.shadow.camera.bottom = -span;
-    key.shadow.camera.far = distance * 4;
-    key.shadow.bias = -0.0008;
-    key.shadow.normalBias = 0.02;
-  }
-  group.add(key, key.target, rim, rim.target);
-
-  const keyOffset = (opts.keyOffset ?? new THREE.Vector3(-0.55, 0.62, 0.75)).normalize().multiplyScalar(distance);
-  const rimOffset = (opts.rimOffset ?? new THREE.Vector3(0.7, 0.35, -0.72)).normalize().multiplyScalar(distance);
-
-  const m = new THREE.Matrix4();
-  const right = new THREE.Vector3();
-  const up = new THREE.Vector3();
-  const back = new THREE.Vector3();
-  const place = (light: THREE.DirectionalLight, off: THREE.Vector3, target: THREE.Vector3) => {
-    const p = new THREE.Vector3()
-      .addScaledVector(right, off.x)
-      .addScaledVector(up, off.y)
-      .addScaledVector(back, -off.z);
-    light.position.copy(target).add(p);
-    light.target.position.copy(target);
-    light.target.updateMatrixWorld();
-  };
-
-  function update(camera: THREE.Camera) {
-    m.copy(camera.matrixWorld);
-    right.setFromMatrixColumn(m, 0).normalize();
-    up.setFromMatrixColumn(m, 1).normalize();
-    back.setFromMatrixColumn(m, 2).normalize();
-    const target = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
-    // 光的目标取「相机前方 distance*0.35 处」——正交/透视都够用，不必知道被摄对象
-    target.addScaledVector(back, -distance * 0.35);
-    place(key, keyOffset, target);
-    place(rim, rimOffset, target);
-  }
-
-  return { key, rim, group, update };
 }
 
 /* ------------------------------------------------------------------ *
@@ -881,11 +607,21 @@ export interface GradeOptions {
   strength?: number;
   saturation?: number;
   contrast?: number;
+  /**
+   * 是否把输入的 alpha 带到输出（默认 true）。
+   * 此前这里硬写 1.0：`renderer` 是 alpha:true，调色 pass 一过整张画布就不透明了，
+   * 透明背景必须靠「往场景里垫棚壁」绕过去（见 editors/scene.ts 的注释）。
+   * 关掉它只用于显式需要不透明输出的场合（截图、离屏合成）。
+   */
+  preserveAlpha?: boolean;
 }
 
 /**
  * 一个 pass 干两件事：暗角（把视线压向角色）+ 冷暖分离调色。
  * 放在 Bloom 之后、OutputPass 之前——此时是线性光，乘色即物理正确的染色。
+ *
+ * alpha：RGB 只做颜色运算，alpha 原样透传（`preserveAlpha`），否则后处理链会
+ * 把透明画布变成不透明黑底。
  */
 export function createGradePass(opts: GradeOptions = {}): ShaderPass {
   const shader: THREE.ShaderMaterialParameters = {
@@ -898,6 +634,7 @@ export function createGradePass(opts: GradeOptions = {}): ShaderPass {
       uSplit: { value: opts.strength ?? 0.35 },
       uSaturation: { value: opts.saturation ?? 1.06 },
       uContrast: { value: opts.contrast ?? 1.05 },
+      uPreserveAlpha: { value: opts.preserveAlpha === false ? 0 : 1 },
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
@@ -915,10 +652,12 @@ export function createGradePass(opts: GradeOptions = {}): ShaderPass {
       uniform float uSplit;
       uniform float uSaturation;
       uniform float uContrast;
+      uniform float uPreserveAlpha;
       varying vec2 vUv;
       const vec3 LUMA = vec3( 0.2126, 0.7152, 0.0722 );
       void main() {
-        vec3 c = texture2D( tDiffuse, vUv ).rgb;
+        vec4 src = texture2D( tDiffuse, vUv );
+        vec3 c = src.rgb;
 
         float l = dot( c, LUMA );
         // 冷暖分离：暗部乘冷端、亮部乘暖端
@@ -935,7 +674,10 @@ export function createGradePass(opts: GradeOptions = {}): ShaderPass {
         float v = 1.0 - uVignette * pow( clamp( dot( d, d ) * 2.0, 0.0, 1.0 ), uVignettePower );
         c *= clamp( v, 0.0, 1.0 );
 
-        gl_FragColor = vec4( max( c, vec3( 0.0 ) ), 1.0 );
+        // 保留输入的 alpha：颜色运算只碰 rgb。Bloom 的加性合成可能把 alpha 堆过 1，
+        // 这里夹一下；preserveAlpha=0 时退回不透明（旧行为，供截图/离屏合成对照）。
+        float a = mix( 1.0, clamp( src.a, 0.0, 1.0 ), uPreserveAlpha );
+        gl_FragColor = vec4( max( c, vec3( 0.0 ) ), a );
       }
     `,
   };
@@ -959,54 +701,5 @@ export function updateNprUniforms(
   camera.getWorldPosition(u.uNprCamPos.value);
   if (keyLight) {
     u.uNprKeyDir.value.copy(keyLight.position).sub(keyLight.target.position).normalize();
-  }
-}
-
-/* ------------------------------------------------------------------ *
- * 12. 预设
- * ------------------------------------------------------------------ */
-
-/** 一键预设：把 uniforms / rig / grade 调到「终末地复刻」或「原管线」 */
-export interface NprPresetContext {
-  uniforms: NprUniforms;
-  rig?: CameraLockedRig;
-  grade?: ShaderPass;
-}
-
-export function applyPreset(ctx: NprPresetContext, name: 'endfield' | 'baseline'): void {
-  const u = ctx.uniforms;
-  const g = ctx.grade;
-  if (name === 'baseline') {
-    u.uNprEnable.value = 0;
-    u.uNprRimStrength.value = 0;
-    u.uNprTintStrength.value = 0;
-    u.uNprRampLow.value = 1;
-    if (ctx.rig) {
-      ctx.rig.key.intensity = 1.35;
-      ctx.rig.rim.intensity = 0.35;
-    }
-    if (g) {
-      g.uniforms.uVignette.value = 0;
-      g.uniforms.uSplit.value = 0;
-      g.uniforms.uSaturation.value = 1;
-      g.uniforms.uContrast.value = 1;
-    }
-    return;
-  }
-  u.uNprEnable.value = 1;
-  u.uNprRampLow.value = 0.55;
-  u.uNprRampSoft.value = 0.34;
-  u.uNprTintStrength.value = 0.5;
-  u.uNprRimStrength.value = 0.3;
-  u.uNprSpecStrength.value = 0.22;
-  if (ctx.rig) {
-    ctx.rig.key.intensity = 1.9;
-    ctx.rig.rim.intensity = 0.55;
-  }
-  if (g) {
-    g.uniforms.uVignette.value = 0.42;
-    g.uniforms.uSplit.value = 0.35;
-    g.uniforms.uSaturation.value = 1.06;
-    g.uniforms.uContrast.value = 1.05;
   }
 }

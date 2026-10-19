@@ -319,7 +319,7 @@ export const workshopScene: ScenePack<WorkshopHandles> = {
   cn: '女巫工坊',
   span: { w: SPAN_W, h: SPAN_H },
   focus: [0.3, 0.6, 0.1],
-  build({ scene }) {
+  build({ scene, depth, params }) {
     const room = buildRoom();
     scene.add(room.group);
 
@@ -328,10 +328,12 @@ export const workshopScene: ScenePack<WorkshopHandles> = {
       room.fountainPoint,
       new THREE.Vector3(1.9, 1.7, -2.8),
       [new THREE.Vector3(3.4, 0.3, -2.5), new THREE.Vector3(-3.4, 0.3, 2.4)],
+      // 舞台开了 softParticles 才有 depth；没开就不装模块（逐像素等于旧行为）
+      { depth, params },
     );
     scene.add(particles.group);
 
-    const industrial = buildIndustrial();
+    const industrial = buildIndustrial(undefined, { depth, params });
     scene.add(industrial.group);
 
     let t = 0;

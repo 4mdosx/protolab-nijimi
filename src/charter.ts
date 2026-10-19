@@ -22,9 +22,14 @@
  *   faceGlow  面部自发光强度（仅 face）
  *   metalGlow 金属微自发光强度（仅 metal，缺省 0.1）
  *   outline   描边壳策略 enable / hide（仅 outline）
+ *   shader    表面着色模块（可选；id 指向 src/shader 的注册表，转换期校验）
+ *
+ * 契约 v2 起允许 **新增可选字段**。`shader` 是 P2 加的：把「这个部位要不要元素化 /
+ * 要不要细节层」从运行期猜测搬到资产声明里，转换期就能查出「模块名打错」。
  */
 
 import * as THREE from 'three';
+import { setQueue } from './queue';
 
 export const CHARTER_VERSION = 2;
 
@@ -56,6 +61,18 @@ export const TRACK_OF_ROLE: Record<CharterRole, CharterTrack> = {
   misc: 'npr',
 };
 
+/**
+ * 表面着色声明。两种层级，可叠加：
+ *   模型级（scene.extras.charter.shader）  → 全身生效，例如「这个角色有元素化能力」
+ *   材质级（material.extras.charter.shader）→ 只作用于该部位，例如「只有发梢会溶解」
+ *
+ * 只写 **id**（可带 `@版本`），不写 GLSL——GLSL 归引擎/内容仓的代码，资产只声明意图。
+ */
+export interface CharterShader {
+  /** 模块 id 列表（`src/shader/modules` 注册表里的 key，可带 `@version`） */
+  modules?: string[];
+}
+
 export interface CharterMaterial {
   version: number;
   role: CharterRole;
@@ -71,6 +88,8 @@ export interface CharterMaterial {
   outline?: 'enable' | 'hide';
   /** morph 驱动件（口腔系）：模型无 morph targets 时渲染端整件隐藏 */
   morphOnly?: boolean;
+  /** 该部位的着色模块（可选）；与模型级声明叠加 */
+  shader?: CharterShader;
   [k: string]: unknown;
 }
 
@@ -92,6 +111,8 @@ export interface CharterModel {
    * SDF 明暗（终末地脸部专项），无景别门控。缺省 = 无 SDF，face 走普通 NPR 明暗。
    */
   faceSdf?: string | null;
+  /** 全身着色模块（可选）；与材质级声明叠加 */
+  shader?: CharterShader;
 }
 
 /** 读材质契约。未标注返回 null（调用方应退回名字兜底，并记入报告）。 */
@@ -205,15 +226,19 @@ export function applyCharter(
 
       // ② 透明叠加件：MMD「材质顺序即叠加顺序」glTF 无此语义 ——
       //    契约的 layer 就是那张序表（默认 = PMX 材质序，人工覆盖可修正）。
+      //    队列走语义带 decal（不透明主体之后），带内用 layer 保序。
       if (mat.transparent) {
         mat.depthWrite = false;
-        mesh.renderOrder = c.layer;
+        setQueue(mesh, 'decal', c.layer);
       }
 
-      // ③ 描边壳：PMX 里靠 alpha=0 隐藏，契约里明确 enable 才当描边用
+      // ③ 描边壳：PMX 里靠 alpha=0 隐藏。曾试过「转反向 hull」
+      //    （toNprMaterial outline 分支），实测 akane 的壳是全身复制
+      //    （17199 顶点、bbox=全身），BackSide 壳在蒙皮网格上产生
+      //    全身轮廓紫黑噪点镶边（2026-10-16 动作编辑器实测对照：
+      //    隐藏壳后噪点消失）——在 hull 稳定前一律恢复原语义隐藏。
       if (c.role === 'outline') {
-        if (c.outline === 'enable') mesh.renderOrder = -1; // 先画，避免压住本体
-        else mesh.visible = false;
+        mesh.visible = false;
       }
 
       // ③b morph 驱动件：无 morph targets 就没有「张嘴」这件事，整件隐藏

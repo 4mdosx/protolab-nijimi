@@ -6,10 +6,18 @@
 
 import * as THREE from 'three';
 import { createStage } from '../src/stage';
+import { isBuiltinParam } from '../src/shader/params';
+import { listModules } from '../src/shader/module';
+import { SHOW_MODULES, chargeBurst, reform } from '../src/kits/shows';
+import { createDepthEdgePass } from '../src/post-passes';
 import { applyBackdrop } from './studio';
 
 const container = document.getElementById('viewport')!;
-const s = createStage(container); // withCharacter 默认 true
+// characterModules 是「能力在加载期定死」的落点：装好 dissolve / rim-pulse 之后，
+// 演出只驱动参数，不会在播放时重编 shader。
+// softParticles：主渲染前多渲一遍半分辨率场景深度，粒子/微尘贴着几何时淡出
+// （不加这一行也能跑，粒子会「糊」在家具上——那种脏点很难归因，所以默认开着）
+const s = createStage(container, { characterModules: SHOW_MODULES, softParticles: { scale: 0.5 } });
 // EffectComposer 会丢 alpha（透明处渲黑），浅色棚壁直接垫进 3D 场景
 applyBackdrop(s.scene);
 const D = s.debug;
@@ -80,6 +88,97 @@ bloomBtn.addEventListener('click', () => {
 });
 
 $('resetView').addEventListener('click', () => s.view.reset());
+
+// ---- 着色参数面板：从 ParamBus 自动生成滑杆 ----
+// 参数名与中文标签来自模块声明（ShaderModule.params.label）——这就是 P1 把每个
+// 参数声明「放进模块里」的回报：编辑器不需要再维护第二份名单。
+const LABELS = new Map<string, string>();
+function refreshLabels() {
+  for (const m of listModules()) {
+    for (const p of m.params ?? []) if (p.label) LABELS.set(p.id, p.label);
+  }
+}
+
+const slidersHost = $('paramSliders');
+const slidersEmpty = $('paramEmpty');
+const builtSliders = new Set<string>();
+
+function buildSliders() {
+  refreshLabels();
+  const ids = s.params.ids.filter(
+    (id) => !isBuiltinParam(id) && s.params.typeOf(id) === 'float' && !builtSliders.has(id),
+  );
+  if (ids.length === 0) return;
+  slidersEmpty.style.display = 'none';
+  for (const id of ids) {
+    const current = Number(s.params.get(id)?.value ?? 0);
+    const max = Math.max(1, Math.ceil(Math.abs(current) * 2));
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('label');
+    label.textContent = LABELS.get(id)?.slice(0, 7) ?? id.replace(/^u/, '');
+    label.title = `${id} · ${LABELS.get(id) ?? ''}`;
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = '0';
+    input.max = String(max);
+    input.step = String(Math.max(0.001, max / 200));
+    input.value = String(Math.min(max, Math.max(0, current)));
+    const value = document.createElement('span');
+    value.className = 'val';
+    value.textContent = current.toFixed(2);
+    input.addEventListener('input', () => {
+      const v = parseFloat(input.value);
+      // 写入者标成 editor：与演出的 `fx:<id>` 抢同一个参数时，notice 会说是谁被拒了
+      s.params.set(id, v, 'editor');
+      value.textContent = v.toFixed(2);
+    });
+    row.append(label, input, value);
+    slidersHost.appendChild(row);
+    builtSliders.add(id);
+  }
+}
+const sliderTimer = setInterval(buildSliders, 500);
+setTimeout(() => { clearInterval(sliderTimer); buildSliders(); }, 20000);
+
+// ---- 演出 ----
+$('playCharge').addEventListener('click', () => s.effects.play(chargeBurst()));
+$('playReform').addEventListener('click', () => s.effects.play(reform()));
+
+// ---- 深度描边（读 post.depthTexture，插在 afterTonemap）----
+let depthEdgeOn = false;
+$('toggleDepthEdge').addEventListener('click', (e) => {
+  const btn = e.currentTarget as HTMLElement;
+  depthEdgeOn = !depthEdgeOn;
+  if (depthEdgeOn) {
+    if (!s.post.has('depth-edge')) {
+      s.post.insert({
+        id: 'depth-edge',
+        anchor: 'afterTonemap',
+        reads: ['depth'],
+        create: () => createDepthEdgePass({
+          camera: s.camera,
+          depthTexture: s.post.depthTexture,
+          strength: 0.85,
+          threshold: 0.015,
+        }),
+      });
+    }
+    s.post.setEnabled('depth-edge', true);
+  } else if (s.post.has('depth-edge')) {
+    s.post.setEnabled('depth-edge', false);
+  }
+  btn.classList.toggle('on', depthEdgeOn);
+  btn.textContent = `深度描边：${depthEdgeOn ? '开' : '关'}`;
+});
+
+// ---- notice：降级与冲突都摆到脸上，别只在 console 里活一帧 ----
+const noticeLog = $('noticeLog');
+s.onNotice(() => {
+  const last = s.notices.log.slice(-2).map((n) => n.message).join(' / ');
+  noticeLog.textContent = last || '—';
+  noticeLog.classList.toggle('warn', s.notices.log.some((n) => n.level === 'error'));
+});
 
 // ---- 视窗交互（拖拽平移 / 滚轮缩放，与主工程同 rig）----
 const canvas = s.renderer.domElement;

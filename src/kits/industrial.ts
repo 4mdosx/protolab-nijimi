@@ -14,6 +14,15 @@
 import * as THREE from 'three';
 import { modernMaterials, type ModernMaterials } from '../materials';
 import { gaugeDialTexture, radialGlowTexture, warningStripeTexture } from '../textures';
+import { applySoftParticles } from '../soft-particles';
+import type { DepthPrepass } from '../depth-prepass';
+import type { ParamBus } from '../shader/params';
+
+/** 萤火微尘要不要软淡出（给了深度预 pass 才有意义） */
+export interface IndustrialOptions {
+  depth?: DepthPrepass | null;
+  params?: ParamBus;
+}
 
 export interface IndustrialHandles {
   group: THREE.Group;
@@ -60,7 +69,10 @@ function shadowAll(root: THREE.Object3D) {
   });
 }
 
-export function buildIndustrial(mats: ModernMaterials = modernMaterials()): IndustrialHandles {
+export function buildIndustrial(
+  mats: ModernMaterials = modernMaterials(),
+  opts: IndustrialOptions = {},
+): IndustrialHandles {
   const group = new THREE.Group();
 
   /* ---------- 反应釜（后墙中段） ---------- */
@@ -332,6 +344,11 @@ export function buildIndustrial(mats: ModernMaterials = modernMaterials()): Indu
       blending: THREE.AdditiveBlending, toneMapped: false,
     }),
   );
+  // 微尘穿过反应釜/储罐时按距离淡出——不装软粒子的话它们会「糊」在金属表面上，
+  // 这是加色粒子的通病（没有体积感，只有一层脏点）。
+  if (opts.depth && motes.material instanceof THREE.PointsMaterial) {
+    applySoftParticles(motes.material, opts.depth, { params: opts.params, distance: 0.28 });
+  }
   group.add(motes);
 
   // 木桶/坩埚等程序化几何上的平铺贴图连续化

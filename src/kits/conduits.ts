@@ -6,6 +6,9 @@
  */
 
 import * as THREE from 'three';
+import { setQueue } from '../queue';
+import type { ParamBus } from '../shader/params';
+import { defineMaterial } from '../shader/define';
 
 const VERTEX = /* glsl */ `
   varying vec2 vUv;
@@ -15,12 +18,9 @@ const VERTEX = /* glsl */ `
   }
 `;
 
+// 注意：uniform 声明由 defineMaterial 按参数表自动生成，这里**不要**再写 `uniform ...;`
+// （重复声明会编译失败）。这是层 B 和手写 ShaderMaterial 最不一样的约定。
 const FRAGMENT = /* glsl */ `
-  uniform float uTime;
-  uniform float uFlow;     // 0=停摆 1=流动
-  uniform vec3 uColor;
-  uniform float uOpacity;
-  uniform float uHighlight; // 悬停高亮 0/1
   varying vec2 vUv;
   void main() {
     // 沿线流动的亮段
@@ -46,6 +46,15 @@ export interface Conduit {
 export class ConduitManager {
   group = new THREE.Group();
   private conduits = new Map<string, Conduit>();
+  /**
+   * 参数总线（可选）。传了就把 `uTime` 绑到引擎的内建时间上——
+   * 流光按**真实 dt** 走，不再靠内容侧每帧 `setTime()` 喂 1/30 的动画时钟。
+   */
+  private readonly params: ParamBus | null;
+
+  constructor(params: ParamBus | null = null) {
+    this.params = params;
+  }
 
   private static edgeKey(fromSlot: number, fromPort: number, toSlot: number, toPort: number): string {
     return `${fromSlot}:${fromPort}>${toSlot}:${toPort}`;
@@ -71,22 +80,37 @@ export class ConduitManager {
     const h = Math.max(a.y, b.y) + 0.22;
     const curve = ConduitManager.makePath(a, b, h);
     const geom = new THREE.TubeGeometry(curve, 32, 0.014, 8, false);
-    const material = new THREE.ShaderMaterial({
-      vertexShader: VERTEX,
-      fragmentShader: FRAGMENT,
-      uniforms: {
-        uTime: { value: 0 },
-        uFlow: { value: 0 },
-        uColor: { value: new THREE.Color(0x8ad8ff) },
-        uOpacity: { value: 0.85 },
-        uHighlight: { value: 0 },
+    // 层 B：时间由引擎给（`builtins: ['time']` → 内建 uTime，真实 dt），
+    // 队列由语义定（`effect` 带），参数表同时生成 uniform 声明。
+    // `local` 里的是**每条线私有**的量：共享 uOpacity 会让「悬停一条、全部变淡」。
+    const material = defineMaterial(
+      {
+        id: 'conduit-flow',
+        name: 'ConduitFlow',
+        queue: 'effect',
+        blending: 'additive',
+        depth: { write: false },
+        builtins: ['time'],
+        params: [
+          { id: 'uFlow', type: 'float', label: '流量（0 停摆 / 1 流动）' },
+          { id: 'uColor', type: 'color', label: '连线颜色' },
+          { id: 'uOpacity', type: 'float', label: '不透明度' },
+          { id: 'uHighlight', type: 'float', label: '悬停高亮（0/1）' },
+        ],
+        local: ['uFlow', 'uColor', 'uOpacity', 'uHighlight'],
+        values: {
+          uFlow: 0,
+          uColor: new THREE.Color(0x8ad8ff),
+          uOpacity: 0.85,
+          uHighlight: 0,
+        },
+        vert: VERTEX,
+        frag: FRAGMENT,
       },
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    });
+      { params: this.params ?? undefined },
+    );
     const mesh = new THREE.Mesh(geom, material);
-    mesh.renderOrder = 10;
+    setQueue(mesh, 'effect', 0);
     const conduit: Conduit = { edgeKey: key, mesh, material, fromSlot, toSlot, highlight: false };
     this.group.add(mesh);
     this.conduits.set(key, conduit);
@@ -114,6 +138,10 @@ export class ConduitManager {
     return [...this.conduits.values()];
   }
 
+  /**
+   * 手动喂时间（旧接口）。
+   * @deprecated 传了 `ParamBus` 时不要调：`uTime` 归引擎（真实时间），这里写就是抢写。
+   */
   setTime(t: number) {
     for (const c of this.conduits.values()) c.material.uniforms.uTime.value = t;
   }
@@ -125,7 +153,8 @@ export class ConduitManager {
       c.highlight = related && slot != null;
       c.material.uniforms.uHighlight.value = related && slot != null ? 1 : 0;
       c.material.depthTest = !(related && slot != null);
-      c.mesh.renderOrder = related && slot != null ? 99 : 10;
+      // 同一条带（effect）内把悬停的那几条压到后面画：带内偏移，不跨带抢号
+      setQueue(c.mesh, 'effect', related && slot != null ? 10 : 0);
       if (slot != null && !related) c.material.uniforms.uOpacity.value = 0.15;
       else c.material.uniforms.uOpacity.value = 0.85;
     }

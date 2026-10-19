@@ -20,6 +20,8 @@ import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js';
 import { modernMaterials, type ModernMaterials } from './materials';
 import { applyCharter, readModelCharter, type CharterModel, type CharterReport } from './charter';
+import { loadExpression, loadExpressionManifest, type ExpressionLayer } from './expression';
+import { ExpProtocol } from './exp-protocol';
 
 export interface CharacterHandles {
   group: THREE.Group;
@@ -27,6 +29,16 @@ export interface CharacterHandles {
   readonly position: THREE.Vector3;
   /** 骨骼动画驱动（当前模型无动画，接口留好） */
   mixer?: THREE.AnimationMixer | null;
+  /**
+   * 表情层（写 morphTargetInfluences + 材质，与骨骼动画正交）。
+   * 契约里没有该模型的表情档案时为 null —— 调用方必须判空，不要静默假设「有脸」。
+   */
+  expression?: ExpressionLayer | null;
+  /**
+   * `witch.exp/1` 指令入口（**消费方唯一该用的东西**）。
+   * 表情层为 null 时它依然存在：指令会走「无表情层」回退并发提示，而不是崩。
+   */
+  exp: ExpProtocol;
   /**
    * 编辑器用的「摆正」朝向（弧度），来自契约。拆包模型正面朝向与本地轴的关系
    * 各包不同，主场景站位角（如夜兰房间里的 -2.36）只在房间机位下成立。
@@ -114,6 +126,17 @@ export async function loadCharacter(
     console.warn(`[charter] ${id} 有 ${report.unbound.length} 个材质未标注（将退回名字兜底）:`, report.unbound);
   }
 
+  // 表情层：契约缺失/模型无 morph 时为 null（引擎不猜、不造）
+  const expression = await loadExpression(id, gltf.scene);
+  // 指令层：即便没有表情层也要有 —— 否则消费方一个 `emote` 就直接 TypeError，
+  // 而不是拿到「这个模型做不了」的提示。
+  const manifest = await loadExpressionManifest();
+  const exp = new ExpProtocol({
+    expr: expression,
+    slots: manifest?.slots ?? {},
+    modelId: id,
+  });
+
   const group = normalizeModel(gltf.scene, charter.targetHeight);
   if (opts.withLights !== false) addLightRig(group);
 
@@ -126,6 +149,8 @@ export async function loadCharacter(
     group,
     position: group.position,
     mixer: null,
+    expression,
+    exp,
     defaultRotY: charter.defaultRotY,
     charter,
     report,
@@ -264,7 +289,9 @@ export async function loadChibiWitch(
   witch.add(rim);
 
   return {
-    group: witch, position: witch.position, mixer: null,
+    group: witch, position: witch.position, mixer: null, expression: null,
+    // 程序化角色没有表情契约：指令一律走「无表情层」回退，仍然有提示
+    exp: new ExpProtocol({ expr: null, slots: {}, modelId: 'witch' }),
     defaultRotY: -0.5, charter: null,
     report: { bound: 0, unbound: [], roles: {}, modelId: null, morphOnlyHidden: [] },
   };

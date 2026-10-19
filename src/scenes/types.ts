@@ -13,12 +13,25 @@
  */
 
 import type * as THREE from 'three';
+import type { DepthPrepass } from '../depth-prepass';
+import type { ParamBus } from '../shader/params';
 
 export interface ScenePackContext {
   /** 引擎的场景对象（内容包直接 add 或返回 group，两种都行） */
   scene: THREE.Scene;
   /** 动画层步长（秒，= 1 / ANIM_FPS）——内容动画按它推进，别用真实帧 dt */
   animStep: number;
+  /**
+   * 深度预 pass（仅当舞台开了 `softParticles`）。内容包的粒子/烟幕要软淡出就把它
+   * 交给 `applySoftParticles`（或 `new ElementParticles(..., { depth })`）。
+   * 它是**场景渲染期**的深度，不是 `post.depthTexture`（后者场景渲完才有）。
+   */
+  depth?: DepthPrepass | null;
+  /**
+   * 参数总线（舞台的那一条）。内容侧要声明自己的效果参数、要标题能出现在编辑器
+   * 滑杆里，就往这里 `declare`，别自己 new uniform——那样演出与编辑器都改不到它。
+   */
+  params?: ParamBus;
 }
 
 export interface ScenePackInstance<H = unknown> {

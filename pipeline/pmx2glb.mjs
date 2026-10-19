@@ -25,7 +25,19 @@
  *
  * 骨骼: 平移链示（MMD 骨骼静止姿态只有位移，无旋转），rest 旋转全为 identity，
  *       inverseBindMatrix = 逆全局平移。SDEF/QDEF 顶点按 BDEF 近似（验证期够用）。
- * 不支持: 变形器 morphs（表情）、物理、IK、toon/sphere 贴图 —— 按需再加。
+ *
+ * 表情 morph（--expr）:
+ *   按 pipeline/expression-rules.mjs 的槽位档案筛选 PMX 的 vertex morph，写成
+ *   glTF morph target（POSITION delta，**只导位移不导法线**——面部明暗走 SDF 阈值场）。
+ *   实现要点：
+ *     · 全部 primitive 共享同一个 POSITION accessor，所以一份全模型 delta accessor
+ *       可以被所有 primitive 的 targets 共同引用，**不做索引重映射**。
+ *     · delta 用 **sparse accessor**（base 值全 0）：实测把 20 个 morph 从 ~15 MB
+ *       压到 ~1 MB，而 three 的 GLTFLoader 会解压成稠密数组（显存占用不变）。
+ *     · target 名写进 PrimitiveTarget 的 name，glTF-Transform 自动落成
+ *       mesh.extras.targetNames，three 据此建 morphTargetDictionary。
+ *
+ * 不支持: 物理、IK、toon/sphere 贴图、group/bone/uv 类 morph —— 按需再加。
  *
  * 运行（隔离运行时）:
  *   NODE_PATH=/Users/token/.workbuddy/binaries/node/workspace/node_modules \
@@ -37,6 +49,7 @@ import path from 'node:path';
 import { MMDParser } from 'mmd-parser';
 import { Document, NodeIO } from '@gltf-transform/core';
 import { PNG } from 'pngjs';
+import { resolveExpression } from './expression-rules.mjs';
 
 // ---------- CLI ----------
 
@@ -44,11 +57,16 @@ const argv = process.argv.slice(2);
 const args = {};
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i].startsWith('--')) args[argv[i].slice(2)] = argv[i + 1], i++;
-  else positional.push(argv[i]);
+  if (argv[i].startsWith('--')) {
+    const key = argv[i].slice(2);
+    const next = argv[i + 1];
+    // 无值开关（--expr）与「下一个是另一个开关」都当布尔 true
+    if (next === undefined || next.startsWith('--')) args[key] = true;
+    else { args[key] = next; i++; }
+  } else positional.push(argv[i]);
 }
 if (positional.length < 1) {
-  console.error('用法: node pipeline/pmx2glb.mjs <input.pmx> [output.glb] [--scale 0.08] [--name <名>]');
+  console.error('用法: node pipeline/pmx2glb.mjs <input.pmx> [output.glb] [--scale 0.08] [--name <名>] [--expr] [--model <id>]');
   process.exit(1);
 }
 const inputPath = path.resolve(positional[0]);
@@ -397,6 +415,65 @@ const mesh = doc.createMesh('mesh');
 for (const prim of prims) mesh.addPrimitive(prim);
 const bodyNode = doc.createNode('body').setMesh(mesh).setSkin(skin);
 root.addChild(bodyNode);
+
+// ---- 表情 morph（--expr）----
+// 放在 mesh 组好之后：PrimitiveTarget 必须在 primitive 已连进图之后才 addTarget。
+if (args.expr) {
+  const modelId = args.model ?? MODEL_NAME;
+  const expr = resolveExpression(pmx, modelId);
+  const byName = new Map((pmx.morphs ?? []).map((m) => [m.name, m]));
+  const built = [];
+  let zeroSkipped = 0;
+
+  for (const t of expr.targets) {
+    const morph = byName.get(t.name);
+    if (!morph || morph.type !== 1) { zeroSkipped++; continue; }
+    // delta 必须与 base 同空间：X 取反 + 同倍缩放（见上方顶点缓冲的坐标转换）
+    const delta = new Float32Array(n * 3);
+    let moved = 0;
+    for (const e of morph.elements ?? []) {
+      const v = e.index;
+      if (!(v >= 0 && v < n)) continue;
+      const dx = -e.position[0] * SCALE;
+      const dy = e.position[1] * SCALE;
+      const dz = e.position[2] * SCALE;
+      if (dx === 0 && dy === 0 && dz === 0) continue;
+      delta[v * 3] = dx; delta[v * 3 + 1] = dy; delta[v * 3 + 2] = dz;
+      moved++;
+    }
+    if (!moved) { zeroSkipped++; continue; }
+    // sparse：base 全 0，只存非零位移 → 文件体积降一个数量级（three 读回时自动展开）
+    const acc = doc.createAccessor(`MORPH_${morph.name}`)
+      .setType('VEC3').setArray(delta).setBuffer(buffer).setSparse(true);
+    built.push({ name: morph.name, acc, moved, sparseBytes: moved * (12 + 2) });
+  }
+
+  // glTF 规范：同一 mesh 下所有 primitive 的 targets 数量与顺序必须一致
+  for (const prim of prims) {
+    for (const t of built) {
+      prim.addTarget(doc.createPrimitiveTarget(t.name).setAttribute('POSITION', t.acc));
+    }
+  }
+
+  const denseBytes = built.length * n * 12;
+  const sparseBytes = built.reduce((s, t) => s + t.sparseBytes, 0);
+  const covered = expr.targets.length;
+  console.log(`\n[expr] model=${modelId}  gaze=${expr.gazeMode}  blink=${expr.blinkSource}`);
+  console.log(`  目标 ${built.length} 个（槽位引用 ${covered}）· 覆盖 ${expr.coverage.covered}/${expr.coverage.total} 槽位`
+    + (zeroSkipped ? ` · 跳过 ${zeroSkipped}（非 vertex 或零位移）` : ''));
+  console.log(`  delta 体积 dense ${(denseBytes / 1048576).toFixed(2)} MB → sparse ${(sparseBytes / 1048576).toFixed(2)} MB`
+    + `（${((1 - sparseBytes / Math.max(1, denseBytes)) * 100).toFixed(1)}% 省掉）`);
+  for (const t of built) {
+    const aff = expr.targets.find((x) => x.name === t.name)?.affected ?? 0;
+    console.log(`    ${t.name.padEnd(12)} 影响 ${String(aff).padStart(5)} 顶点`
+      + ` · 实写 ${String(t.moved).padStart(5)}（${((t.moved / n) * 100).toFixed(1)}% 稠密度）`);
+  }
+  if (expr.unresolved.length) console.log(`  unresolved（该模型做不了）: ${expr.unresolved.join(' ')}`);
+  for (const s of expr.sideChecks) {
+    console.log(`  左右校验 ${s.slot} ← 「${s.morph}」 质心 x=${s.cx?.toFixed(3)} → ${s.got}（期望 ${s.want}）`);
+  }
+  for (const w of expr.warnings) console.warn(`  ⚠ ${w}`);
+}
 
 // ---- 写 GLB ----
 const io = new NodeIO();

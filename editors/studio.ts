@@ -8,6 +8,7 @@
  */
 
 import * as THREE from 'three';
+import { setQueue } from '../src/queue';
 
 function canvasTexture(w: number, h: number, draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void): THREE.CanvasTexture {
   const c = document.createElement('canvas');
@@ -155,7 +156,7 @@ export function buildStudio(scene: THREE.Scene): StudioHandles {
   );
   grid.rotation.x = -Math.PI / 2;
   grid.position.y = -0.119;
-  grid.renderOrder = 1;
+  setQueue(grid, 'decal', 0);
   scene.add(grid);
 
   // ---- 升天光柱：远处一圈（r=13m），网格主轴方向的竖线，渐隐接进天空 ----
@@ -173,7 +174,7 @@ export function buildStudio(scene: THREE.Scene): StudioHandles {
     const p = new THREE.Mesh(new THREE.PlaneGeometry(0.14, 12), pillarMat);
     p.position.set(Math.cos(ang) * R, 12 / 2 - 0.12, Math.sin(ang) * R);
     p.lookAt(0, 12 / 2 - 0.12, 0); // 面朝圆心，从棚内看是「线」不是「面」
-    p.renderOrder = 2;
+    setQueue(p, 'decal', 1);
     pillars.add(p);
   }
   scene.add(pillars);

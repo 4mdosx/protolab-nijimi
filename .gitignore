@@ -16,6 +16,9 @@ dist/
 /refs/
 /pre/
 
+# agent 工作记录（本地过程材料，不进版本库）
+/.workbuddy/
+
 # logs / env / os
 logs/
 *.log

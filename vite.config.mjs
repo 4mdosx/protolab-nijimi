@@ -14,12 +14,14 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        // 编辑器总览（四台编辑器的入口页）
+        // 编辑器总览（六台编辑器的入口页）
         main: r('index.html'),
         characterLab: r('editors/character.html'),
         poseLab: r('editors/pose.html'),
         sceneLab: r('editors/scene.html'),
         integratedLab: r('editors/integrated.html'),
+        shaderLab: r('editors/shader.html'),
+        effectsLab: r('editors/effects.html'),
       },
     },
   },

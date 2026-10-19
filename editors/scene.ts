@@ -8,7 +8,7 @@ import { createStage } from '../src/stage';
 import { applyBackdrop } from './studio';
 
 const container = document.getElementById('viewport')!;
-const s = createStage(container, { withCharacter: false });
+const s = createStage(container, { withCharacter: false, softParticles: { scale: 0.5 } });
 // EffectComposer 会丢 alpha（透明处渲黑），浅色棚壁直接垫进 3D 场景
 applyBackdrop(s.scene);
 const D = s.debug;

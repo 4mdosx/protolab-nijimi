@@ -237,6 +237,93 @@ export const NAME_RULES = [
 ];
 
 /* ------------------------------------------------------------------ *
+ * ③½ SHADER_MODULES（可以写进契约的着色模块）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 资产**可以声明**的表面着色模块。与 `src/shader/modules/` 的注册表一一对应：
+ * 转换期（charter-glb）与 CI（render-modules-check）都按这张表校验 id，
+ * 资产里写错一个字母会在 `npm run charter` 就失败，而不是等浏览器里画面不对。
+ *
+ * 准入三条（都要满足）：
+ *   ① **纯数据**：模块文件只 import `../module`，不 import three、不碰 DOM
+ *      —— 因为转换期要在 Node 侧直接 import 它做校验；
+ *   ② **零默认可见**：参数默认 0 / 安全值，声明了也不改变原观感；
+ *   ③ **只依赖 NPR 表面的作用域变量**（`nprN` / `nprV` / `nprOut` / `vNprWPos`），
+ *      不要求模型侧额外的贴图或缓冲。
+ *
+ * 两条刻意排除：
+ *   - `soft-particles`：它要绑深度预 pass 的四个 uniform，由 `applySoftParticles()` 在
+ *     运行期接线（内容侧代码，不是资产声明）。写进契约只会拿到一张未绑定的深度图
+ *     ——那是最难查的一类「静默无效」。
+ *   - `ascii-flow`：它是**屏幕空间**效果（读 `uResolution` 切字符格），属于「这一段演出」
+ *     而不属于「这个资产的固有外观」。声明它还会把内建 uniform 拖进 `params` 清单，
+ *     让「契约参数 = 模块参数」这条对齐断言失去意义。要走 ASCII 就在代码里
+ *     `characterModules: [asciiFlow]` 挂上。
+ */
+export const SHADER_MODULES = {
+  dissolve: {
+    cn: '溶解 / 元素化',
+    version: 1,
+    params: ['uDissolve', 'uDissolveEdge', 'uDissolveScale', 'uDissolveColor', 'uDissolveGlow'],
+    doc: '世界坐标噪声阈值 discard + 阈值边缘自发光；uDissolve = 0 时逐像素等价于不装',
+  },
+  'rim-pulse': {
+    cn: '边缘光脉冲',
+    version: 1,
+    params: ['uRimPulseColor', 'uRimPulseStrength', 'uRimPulsePower'],
+    doc: '演出用的第二圈轮廓光（宽、可染色、可归零）；uRimPulseStrength = 0 时逐像素等价于不装',
+  },
+};
+
+/**
+ * 校验一批模块引用（`id` 或 `id@version`）。
+ * 返回 `{ errors, warnings }`：errors 让转换失败，warnings 只提示（版本漂移）。
+ */
+export function validateShaderIds(ids, where) {
+  const errors = [];
+  const warnings = [];
+  const known = Object.keys(SHADER_MODULES).join(' / ');
+  for (const raw of ids ?? []) {
+    const [name, ver] = String(raw).split('@');
+    const spec = SHADER_MODULES[name];
+    if (!spec) {
+      errors.push(`${where} 声明了未登记的着色模块「${raw}」（可选：${known}）`);
+      continue;
+    }
+    if (ver !== undefined && Number(ver) !== spec.version) {
+      warnings.push(`${where} 的「${name}」写的是 @${ver}，注册表当前 v${spec.version}——行为以引擎为准`);
+    }
+  }
+  return { errors, warnings };
+}
+
+/**
+ * 求某材质最终要写的模块 id：**模型级 → 族级 → 材质级**，按序合并去重。
+ *
+ * 为什么按这个顺序：模型级是「这个角色的能力」（全身溶解），族级是「这类部位的
+ * 表现」（只有头发有脉冲），材质级是「这个部件的特例」。合并结果就是运行期
+ * `material.modules` 钩子拿到的那串 id，顺序即模块链的拼接顺序（顺序敏感）。
+ */
+export function resolveShader(modelId, role, matName) {
+  const M = MODELS[modelId] ?? {};
+  const ids = [];
+  const sources = [];
+  const push = (from, list) => {
+    for (const id of list ?? []) {
+      const name = String(id).split('@')[0];
+      if (ids.some((x) => String(x).split('@')[0] === name)) continue;
+      ids.push(id);
+      sources.push(`${from}:${id}`);
+    }
+  };
+  push('model', M.shader?.modules);
+  push(`role:${role}`, M.roleShader?.[role]);
+  push('material', M.materialShader?.[matName]);
+  return { ids, sources };
+}
+
+/* ------------------------------------------------------------------ *
  * ④ 模型档案（人工裁定部分）
  * ------------------------------------------------------------------ */
 
@@ -252,6 +339,9 @@ export const NAME_RULES = [
  *   roleOverrides      —— 名字 → 族的类手工覆盖（只写规则判错的）
  *   layerOverrides     —— 名字 → 渲染层（只写 PMX 序判错的）
  *   outline            —— 描边壳策略：'enable' 启用为黑描边 / 'hide' 隐藏
+ *   shader             —— 模型级着色模块（`{ modules: [] }`，全身生效，见 SHADER_MODULES）
+ *   roleShader         —— 族 → 模块（叠加在模型级之上，例如只有头发有脉冲）
+ *   materialShader     —— 材质名 → 模块（叠加在族级之上，单件特例）
  */
 export const MODELS = {
   yelan: {
@@ -271,6 +361,13 @@ export const MODELS = {
       // 「体」是躯干网格（贴 tex3 衣服图集），规则判 misc，人工归 cloth
       体: 'cloth',
     },
+    // 着色声明：夜兰是「元素化」演出的主角（kits/shows.ts 的 chargeBurst / reform
+    // 直接驱动 uDissolve）。写在**模型级**而不是内容侧的 characterModules 里，
+    // 是因为「这具模型有没有元素化能力」属于资产事实——换成没有该能力的模型时，
+    // 演出找不到参数会降级并出声，而不是把整身刷白。
+    shader: { modules: ['dissolve@1'] },
+    // 只有头发带第二圈脉冲：发丝在暗部最容易糊成一块，脉冲是「还活着」的信号。
+    roleShader: { hair: ['rim-pulse@1'] },
   },
 
   si: {

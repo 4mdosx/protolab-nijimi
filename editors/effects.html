@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>nijimi · 演出编辑器</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      background: #0d0b12; color: #cfc6b8; font-size: 12px;
+      display: grid; grid-template-rows: 1fr 362px;
+    }
+
+    /* ---------- 视口 ---------- */
+    #stage { position: relative; min-height: 0; }
+    #viewport { position: absolute; inset: 0; }
+    #viewport canvas { display: block; }
+    #hud {
+      position: absolute; left: 14px; bottom: 10px; z-index: 5;
+      color: #6a6272; font-size: 10.5px; letter-spacing: 0.06em; line-height: 1.6;
+      pointer-events: none;
+    }
+    #hud b { color: #b8a888; font-weight: 500; }
+
+    /* ---------- 右栏 ---------- */
+    #side {
+      position: absolute; top: 12px; right: 12px; z-index: 10; width: 268px;
+      max-height: calc(100% - 24px); overflow-y: auto;
+      background: rgba(20, 17, 25, 0.94); border: 1px solid #332c42;
+      border-radius: 8px; padding: 12px 14px 10px; backdrop-filter: blur(6px);
+    }
+    #side h1 { font-size: 11.5px; letter-spacing: 0.14em; color: #b8a888; font-weight: 600; }
+    #side .sub { color: #5f586a; font-size: 10px; margin: 2px 0 10px; line-height: 1.5; }
+    #side .group { border-top: 1px solid #2a2435; padding: 9px 0 7px; }
+    #side .group > label {
+      display: block; color: #6f6879; font-size: 10px; letter-spacing: 0.1em; margin-bottom: 6px;
+    }
+    #side .row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+    #side .row > label { width: 62px; flex: none; color: #a89c88; font-size: 10.5px; }
+    #side .row .val { width: 40px; text-align: right; color: #7ec8c0; font-size: 10.5px; flex: none; }
+    #side input[type="range"] { flex: 1; accent-color: #e8a34c; min-width: 0; }
+    #side input[type="number"], #side input[type="text"], #side select {
+      font: inherit; font-size: 10.5px; color: #e8ddc8; background: #221c2c;
+      border: 1px solid #3b3348; border-radius: 4px; padding: 3px 4px; min-width: 0;
+    }
+    #side input[type="text"] { flex: 1; }
+    #side input[type="number"] { width: 62px; }
+    #side input[type="color"] {
+      width: 28px; height: 20px; padding: 0; border: 1px solid #3b3348;
+      border-radius: 4px; background: none; flex: none;
+    }
+    #side button, #tlBar button {
+      font: inherit; font-size: 10.5px; color: #e8ddc8; background: #2a2435;
+      border: 1px solid #443b52; border-radius: 5px; padding: 4px 8px; cursor: pointer;
+      letter-spacing: 0.06em;
+    }
+    #side button:hover, #tlBar button:hover { border-color: #e8a34c; }
+    #side button.on, #tlBar button.on {
+      color: #17141c; background: #e8a34c; border-color: #e8a34c; font-weight: 700;
+    }
+    #side button.wide { width: 100%; margin-top: 2px; }
+    #side .hint { color: #5f586a; font-size: 9.5px; line-height: 1.5; margin-top: 4px; }
+    #side .warn { color: #e8a34c; }
+
+    /* 参数状态表 */
+    #paramTable { width: 100%; border-collapse: collapse; }
+    #paramTable td { padding: 2px 0; font-size: 10px; vertical-align: top; }
+    #paramTable td.id { color: #9a90a8; }
+    #paramTable td.v { color: #7ec8c0; text-align: right; width: 54px; }
+    #paramTable tr.miss td.id { color: #8a5a4a; }
+    #paramTable tr.miss td.v { color: #8a5a4a; }
+
+    /* ---------- 时间线 ---------- */
+    #timeline {
+      position: relative; border-top: 1px solid #2a2435; background: #120f18;
+      display: grid; grid-template-rows: 46px 1fr; min-height: 0;
+    }
+    #tlBar {
+      display: flex; align-items: center; gap: 6px; padding: 0 12px;
+      border-bottom: 1px solid #241f2f; color: #6f6879; font-size: 10.5px;
+    }
+    #tlBar .sep { width: 1px; height: 20px; background: #2a2435; margin: 0 4px; }
+    #tlBar .time { color: #e8ddc8; font-size: 12px; letter-spacing: 0.06em; }
+    #tlBar .time i { color: #6f6879; font-style: normal; }
+    #tlBar .spacer { flex: 1; }
+    #tlBar select {
+      font: inherit; font-size: 10.5px; color: #e8ddc8; background: #221c2c;
+      border: 1px solid #3b3348; border-radius: 4px; padding: 3px 4px;
+    }
+    #tlBody { display: grid; grid-template-columns: 178px 1fr; align-items: start; overflow-y: auto; min-height: 0; }
+    #heads { border-right: 1px solid #241f2f; }
+    #heads .pad { height: 22px; border-bottom: 1px solid #1c1826; position: sticky; top: 0; z-index: 6; background: #120f18; }
+    #heads .head {
+      height: 48px; padding: 5px 10px 0 12px; border-bottom: 1px solid #1c1826;
+      display: flex; flex-direction: column; gap: 3px; cursor: pointer;
+    }
+    #heads .head.sel { background: #1b1626; box-shadow: inset 2px 0 0 #e8a34c; }
+    #heads .head .id {
+      color: #cfc6b8; font-size: 10.5px; white-space: nowrap; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #heads .head.sel .id { color: #e8a34c; }
+    #heads .head .meta { display: flex; gap: 6px; align-items: center; }
+    #heads .head .v { color: #7ec8c0; font-size: 11px; }
+    #heads .head .miss { color: #a4644f; font-size: 9.5px; }
+    #heads .head .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+
+    #lanes { position: relative; }
+    #ruler {
+      position: sticky; top: 0; z-index: 6; height: 22px; background: #120f18;
+      border-bottom: 1px solid #1c1826; cursor: ew-resize;
+    }
+    #ruler canvas { display: block; width: 100%; height: 22px; }
+    #lanesInner { position: relative; }
+    .lane {
+      position: relative; height: 48px; border-bottom: 1px solid #1c1826;
+      cursor: crosshair;
+    }
+    .lane.sel { background: #171220; }
+    .lane canvas { display: block; width: 100%; height: 100%; }
+    .dot {
+      position: absolute; width: 9px; height: 9px; margin: -5px 0 0 -4.5px;
+      border-radius: 50%; background: #171220; border: 1.5px solid currentColor;
+      cursor: grab; z-index: 3;
+    }
+    .dot:hover { transform: scale(1.35); }
+    .dot.dragging { cursor: grabbing; transform: scale(1.35); }
+    #cursor {
+      position: absolute; top: 0; bottom: 0; width: 1px; background: #e8a34c;
+      pointer-events: none; z-index: 4;
+    }
+    #cursor::before {
+      content: ""; position: absolute; top: 0; left: -4px; width: 9px; height: 9px;
+      background: #e8a34c; clip-path: polygon(50% 100%, 0 0, 100% 0);
+    }
+
+    /* ---------- 导出 ---------- */
+    #exportPanel {
+      position: absolute; inset: 0; z-index: 30; display: none;
+      background: rgba(8, 6, 12, 0.78); backdrop-filter: blur(3px);
+      padding: 28px;
+    }
+    #exportPanel.open { display: flex; flex-direction: column; }
+    #exportPanel .box {
+      background: #17131f; border: 1px solid #3b3348; border-radius: 8px;
+      padding: 12px 14px; display: flex; flex-direction: column; min-height: 0; flex: 1;
+    }
+    #exportPanel .bar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    #exportPanel .bar h2 { font-size: 11.5px; letter-spacing: 0.12em; color: #b8a888; font-weight: 600; }
+    #exportPanel .bar .spacer { flex: 1; }
+    #exportCode {
+      flex: 1; width: 100%; resize: none; background: #0f0c15; color: #cfc6b8;
+      border: 1px solid #2a2435; border-radius: 6px; padding: 10px;
+      font: inherit; font-size: 11px; line-height: 1.55; white-space: pre;
+      overflow: auto;
+    }
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; overflow: hidden;
+      clip: rect(0 0 0 0); white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <h2 class="sr-only">演出编辑器：用关键帧轨道编一段角色特效时间线，实时预览并导出 EffectSpec 代码。</h2>
+
+  <div id="stage">
+    <div id="viewport"></div>
+    <div id="hud">
+      <b>演出编辑器</b> · 拖关键帧改曲线 · 拖刻度尺 scrub · 双击空白加点 · 右键删点<br />
+      播放走 <b>stage.effects</b>（真实调度）；拖动时切到手动定位，参数写入者 <b>preview</b>
+    </div>
+
+    <aside id="side">
+      <h1>演出 / EFFECTS LAB</h1>
+      <div class="sub">关键帧 → params(t) → EffectSpec。导出的是纯数据代码，没有运行时依赖。</div>
+
+      <div class="group">
+        <label>演出 / SHOW</label>
+        <div class="row"><label>id</label><input id="showId" type="text" value="my-show" /></div>
+        <div class="row"><label>时长 秒</label><input id="dur" type="number" min="0.1" max="20" step="0.05" value="1.9" /><span class="val" id="durVal">1.90</span></div>
+        <div class="row"><label>循环</label><input id="loop" type="checkbox" /><span style="color:#5f586a;font-size:9.5px">loop 只在播放时生效</span></div>
+        <div class="row"><label>结束</label>
+          <select id="onEnd">
+            <option value="restore">restore · 拆走临时件</option>
+            <option value="keep">keep · 永久留下</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="group">
+        <label>颜色常量 / COLOR</label>
+        <div class="row"><label>边缘光</label><input id="rimColor" type="color" value="#9fd8ff" /><input id="rimColorHex" type="text" value="#9fd8ff" /></div>
+        <div class="row"><label>溶解</label><input id="dissColor" type="color" value="#9fd8ff" /><input id="dissColorHex" type="text" value="#9fd8ff" /></div>
+        <div class="hint">曲线表达不了颜色，按常量写给 uRimPulseColor / uDissolveColor。</div>
+      </div>
+
+      <div class="group">
+        <label>冲击波 / SHOCKWAVE（层 C）</label>
+        <div class="row"><label>启用</label><input id="shockOn" type="checkbox" checked /><span style="color:#5f586a;font-size:9.5px">afterTonemap</span></div>
+        <div class="row"><label>起 / 止</label><input id="shockFrom" type="number" min="0" max="1" step="0.01" value="0.30" /><input id="shockTo" type="number" min="0.01" max="1" step="0.01" value="0.85" /></div>
+        <div class="row"><label>强度</label><input id="shockStrength" type="range" min="0" max="2" step="0.05" value="1.15" /><span class="val" id="shockStrengthVal">1.15</span></div>
+      </div>
+
+      <div class="group">
+        <label>ASCII 流动 / 层 A 模块</label>
+        <div class="row"><button id="asciiDemo" class="wide">ASCII 演示（停演出 · 只看字符流）</button></div>
+        <div class="row"><label>行数</label><input id="aRows" type="range" min="12" max="120" step="1" value="54" /><span class="val" id="aRowsV">54</span></div>
+        <div class="row"><label>流速</label><input id="aSpeed" type="range" min="0" max="4" step="0.05" value="1.4" /><span class="val" id="aSpeedV">1.40</span></div>
+        <div class="row"><label>随机度</label><input id="aScatter" type="range" min="0" max="1" step="0.01" value="0.85" /><span class="val" id="aScatterV">0.85</span></div>
+        <div class="row"><label>明度增益</label><input id="aContrast" type="range" min="0.5" max="6" step="0.1" value="2.6" /><span class="val" id="aContrastV">2.60</span></div>
+        <div class="row"><label>门槛</label><input id="aThreshold" type="range" min="0" max="0.6" step="0.01" value="0.06" /><span class="val" id="aThresholdV">0.06</span></div>
+        <div class="row"><label>底残影</label><input id="aFill" type="range" min="0" max="0.4" step="0.01" value="0.06" /><span class="val" id="aFillV">0.06</span></div>
+        <div class="row"><label>随亮度</label><input id="aTint" type="range" min="0" max="1" step="0.01" value="0.55" /><span class="val" id="aTintV">0.55</span></div>
+        <div class="row"><label>亮带</label><input id="aBand" type="range" min="0" max="1" step="0.01" value="0.4" /><span class="val" id="aBandV">0.40</span></div>
+        <div class="row"><label>字符色</label><input id="aColor" type="color" value="#9fd8ff" /></div>
+        <div class="hint">uAscii 由演示开关控制；其余是材质常量，直接写总线。行数按屏幕高度算，格子始终是正方形。</div>
+      </div>
+
+      <div class="group">
+        <label>轨道 / TRACK</label>
+        <div class="row"><label>参数名</label><input id="trackId" type="text" list="paramList" placeholder="uRimPulseStrength" /></div>
+        <div class="row"><label>缓动</label>
+          <select id="trackEase">
+            <option value="smooth">smooth · 两端缓</option>
+            <option value="linear">linear · 匀速</option>
+          </select>
+        </div>
+        <div class="row">
+          <button id="trackDup" style="flex:1">复制轨道</button>
+          <button id="trackDel" style="flex:1">删除轨道</button>
+        </div>
+        <div class="hint">双击轨道空白加点，右键点删点。纵向范围按值自动收紧。</div>
+      </div>
+
+      <div class="group">
+        <label>参数状态 / BUS</label>
+        <table id="paramTable"></table>
+        <div class="hint" id="busHint">—</div>
+      </div>
+
+      <div class="group">
+        <label>导出 / EXPORT</label>
+        <button id="exportBtn" class="wide">生成 EffectSpec 代码</button>
+        <div class="hint">贴回内容仓；材质侧模块要在建舞台时装好，否则参数无人读取。</div>
+      </div>
+    </aside>
+  </div>
+
+  <section id="timeline">
+    <div id="tlBar">
+      <button id="play" class="on">▶ 播放</button>
+      <button id="stop">■ 停止</button>
+      <div class="sep"></div>
+      <button id="prevFrame">◀ 帧</button>
+      <button id="nextFrame">帧 ▶</button>
+      <div class="sep"></div>
+      <span>速度</span>
+      <select id="speed">
+        <option value="1">1×</option>
+        <option value="0.5">0.5×</option>
+        <option value="0.25">0.25×</option>
+      </select>
+      <div class="sep"></div>
+      <span class="time" id="timeText">0.000 <i>/ 1.900 s</i></span>
+      <div class="spacer"></div>
+      <button id="addTrack">+ 轨道</button>
+      <button id="autoFrame">自动取景</button>
+    </div>
+    <div id="tlBody">
+      <div id="heads"><div class="pad"></div></div>
+      <div id="lanes">
+        <div id="ruler"><canvas></canvas></div>
+        <div id="lanesInner"></div>
+        <div id="cursor"></div>
+      </div>
+    </div>
+  </section>
+
+  <div id="exportPanel">
+    <div class="box">
+      <div class="bar">
+        <h2>导出 / EXPORT</h2>
+        <span class="spacer"></span>
+        <button id="copyCode">复制</button>
+        <button id="closeExport">关闭</button>
+      </div>
+      <textarea id="exportCode" spellcheck="false"></textarea>
+    </div>
+  </div>
+
+  <datalist id="paramList"></datalist>
+
+  <script type="module" src="/editors/effects.ts"></script>
+</body>
+</html>

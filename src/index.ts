@@ -8,7 +8,8 @@
  *   stage.render(dt, elapsed);
  *
  * 三层结构：
- *   ① 技术层  charter / npr / materials / textures / particles / stage
+ *   ① 技术层  charter / npr / materials / textures / particles / post / depth-prepass / stage
+ *           扩展层  shader（模块 + 参数总线）、frame（三时钟）、queue（语义队列）、notice
  *   ② 角色层  character / rig / anim（契约化资产 + 骨骼槽位 + 外部动画）
  *   ③ 内容层  kits/*（可复用构件）、scenes/*（内容包，含示例场景）
  *
@@ -22,15 +23,33 @@ export * from './npr';
 export * from './materials';
 export * from './textures';
 export * from './particles';
+export * from './post';
+export * from './depth-prepass';
+export * from './soft-particles';
+export * from './post-passes';
+export * from './output-passes';
+export * from './effects';
 export * from './stage';
+
+/* ①b 扩展层（着色模块 / 参数总线 / 帧上下文 / 语义队列 / 提示） */
+export * from './shader';
+export * from './frame';
+export * from './queue';
+export * from './notice';
 
 /* ② 角色层 */
 export * from './character';
+export * from './character-rendering';
 export * from './rig';
 export * from './anim';
+export * from './expression';
+// 表情/指令的对外契约（FROZEN）与 witch.exp/1 指令流
+export * from './exp-contract';
+export * from './exp-protocol';
 
 /* ③ 内容层（构件 + 内容包契约 + 自带示例场景） */
 export * from './kits/industrial';
+export * from './kits/shows';
 export * from './kits/conduits';
 export * from './scenes/types';
 export * from './scenes/workshop';

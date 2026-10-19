@@ -3,10 +3,18 @@
  * 火（橙，壁炉上升）、水（蓝，喷泉）参与玩法反馈；
  * 风（灰，窗边飘散）、土（棕，盆栽沉积）只做视觉。
  * 粒子密度随对应元素强度变化 —— 「不看数字也能感知」。
+ *
+ * 2026-10-17（P3）：支持**软粒子**。给了 `opts.depth`（舞台的深度预 pass）就装上
+ * `soft-particles` 模块——粒子贴近墙面/地板时按距离淡出，不再「啪」地被深度裁掉。
+ * 不给也完全正常：模块不装，行为和以前逐像素一致。
  */
 
 import * as THREE from 'three';
 import { particleTexture } from './textures';
+import { applySoftParticles } from './soft-particles';
+import type { DepthPrepass } from './depth-prepass';
+import type { ParamBus } from './shader/params';
+import type { NoticeSink } from './notice';
 
 interface P {
   pos: THREE.Vector3;
@@ -15,11 +23,29 @@ interface P {
   maxLife: number;
 }
 
-function makePoints(count: number, color: number, size: number): { points: THREE.Points; positions: Float32Array } {
+/** 粒子系统的可选能力（软粒子是唯一的，但都从舞台来） */
+export interface ElementParticlesOptions {
+  /** 深度预 pass；给了才装软粒子 */
+  depth?: DepthPrepass | null;
+  /** 参数总线（`uSoftDistance` 要能被编辑器/演出驱动） */
+  params?: ParamBus;
+  notices?: NoticeSink;
+  /** 软粒子过渡距离（世界单位，默认 0.35） */
+  softDistance?: number;
+}
+
+function makePoints(
+  count: number,
+  color: number,
+  size: number,
+  name: string,
+  soft?: { depth: DepthPrepass; params?: ParamBus; notices?: NoticeSink; distance?: number },
+): { points: THREE.Points; positions: Float32Array } {
   const positions = new Float32Array(count * 3);
   const geom = new THREE.BufferGeometry();
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mat = new THREE.PointsMaterial({
+    name: `particles/${name}`,
     color,
     size,
     map: particleTexture(),
@@ -29,6 +55,15 @@ function makePoints(count: number, color: number, size: number): { points: THREE
     blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
   });
+  // 软粒子：模块 + 深度 uniform。所有粒子材质共享同一个 uSoftDistance 与深度图，
+  // 变体键相同 → 五个系统仍然只有一个 program。
+  if (soft) {
+    applySoftParticles(mat, soft.depth, {
+      params: soft.params,
+      notices: soft.notices,
+      distance: soft.distance,
+    });
+  }
   const points = new THREE.Points(geom, mat);
   points.frustumCulled = false;
   return { points, positions };
@@ -48,8 +83,10 @@ class ParticleSystem {
     private origin: THREE.Vector3,
     private spawn: (p: P) => void,
     private update: (p: P, dt: number) => void,
+    soft?: { depth: DepthPrepass; params?: ParamBus; notices?: NoticeSink; distance?: number },
+    name = 'points',
   ) {
-    const { points, positions } = makePoints(count, color, size);
+    const { points, positions } = makePoints(count, color, size, name, soft);
     this.points = points;
     this.positions = positions;
     for (let i = 0; i < count; i++) {
@@ -91,7 +128,11 @@ export class ElementParticles {
     fountainPoint: THREE.Vector3,
     windowPoint: THREE.Vector3,
     plantPoints: THREE.Vector3[],
+    opts: ElementParticlesOptions = {},
   ) {
+    const soft = opts.depth
+      ? { depth: opts.depth, params: opts.params, notices: opts.notices, distance: opts.softDistance }
+      : undefined;
     // 火：壁炉上升
     const fire = new ParticleSystem(
       42,
@@ -109,6 +150,8 @@ export class ElementParticles {
         p.vel.y += 0.12 * dt;
         p.vel.x += (Math.random() - 0.5) * 0.02;
       },
+      soft,
+      'fire',
     );
     // 水：喷泉上抛下落
     const water = new ParticleSystem(
@@ -127,6 +170,8 @@ export class ElementParticles {
         p.pos.addScaledVector(p.vel, dt);
         if (p.pos.y < 0.35) p.life = p.maxLife;
       },
+      soft,
+      'water',
     );
     // 风：窗边飘散（纯视觉）
     const wind = new ParticleSystem(
@@ -144,6 +189,8 @@ export class ElementParticles {
         p.pos.addScaledVector(p.vel, dt);
         p.vel.y += Math.sin(p.life * 3) * 0.01 * dt * 60;
       },
+      soft,
+      'wind',
     );
     // 土：盆栽周围缓慢沉积（纯视觉）
     const earthPts: ParticleSystem[] = plantPoints.map(
@@ -160,6 +207,8 @@ export class ElementParticles {
             p.life = 0;
           },
           (p, dt) => p.pos.addScaledVector(p.vel, dt),
+          soft,
+          `earth-${plantPoints.indexOf(pt)}`,
         ),
     );
 

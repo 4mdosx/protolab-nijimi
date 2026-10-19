@@ -23,6 +23,9 @@
  *   ⑦ scene.extras.charter = 模型档案（摆正角 / 身高 / 站位 / 授权）
  *   ⑧ 贴图预算闸：最长边超 BUDGET.maxTexSize 的 PNG 自动 box filter 降采样
  *      （只动契约版；原版永不改写。`--no-resize` 关掉，改回只报告）
+ *   ⑨ 着色模块声明：MODELS[<id>] 的 shader / roleShader / materialShader 合并去重后
+ *      写进 scene.extras.charter.shader 与 material.extras.charter.shader
+ *      （**只写 id，不写 GLSL**；id 在转换期按 SHADER_MODULES 校验，写错直接失败）
  *
  * ⭐ 贴图通道溯源：pmx2glb 把贴图命名为 `tex<PMX 贴图索引>`，而 PMX 里有原始文件名
  * （终末地是 `T_actor_jsspsi_hair_01_D.png` 这种官方命名）。有了 PMX 源就能把每个
@@ -39,7 +42,7 @@ import { NodeIO } from '@gltf-transform/core';
 import { PNG } from 'pngjs';
 import {
   ALPHA_CUT_ROLES, BUDGET, CHARTER_VERSION, FAMILIES, METAL_OK, MODELS, ROLE_TRACK, TRACKS,
-  pmxChannel, pmxOf, resolveMaterial,
+  pmxChannel, pmxOf, resolveMaterial, resolveShader, validateShaderIds,
 } from './charter-rules.mjs';
 
 const argv = process.argv.slice(2);
@@ -164,6 +167,27 @@ for (const input of targets) {
   const root = doc.getRoot();
   const warnings = [];
 
+  /* ---------- 着色声明：先整批校验，再逐材质合并 ---------- */
+  // 位置刻意放在材质循环之前：**资产声明错要比材质映射错更早失败**。
+  // 模块 id 打错在运行期只是「这个部位没效果」，没人会注意到；
+  // 在转换期直接 exitCode=1，逼作者当场改对。
+  {
+    const checks = [
+      [`${id} 模型级 shader`, meta.shader?.modules],
+      ...[Object.entries(meta.roleShader ?? {}).map(([r, list]) => [`${id} 族级 shader[${r}]`, list])],
+      ...[Object.entries(meta.materialShader ?? {}).map(([n, list]) => [`${id} 材质级 shader[${n}]`, list])],
+    ];
+    for (const [where, list] of checks) {
+      const { errors, warnings: ws } = validateShaderIds(list, where);
+      warnings.push(...ws);
+      if (errors.length) {
+        for (const e of errors) console.error(`✗ ${e}`);
+        process.exitCode = 1;
+      }
+    }
+  }
+  const modelShaderIds = meta.shader?.modules ?? [];
+
   /* ---------- 贴图溯源：PMX 原始文件名 → 终末地通道 ---------- */
   const pmxPath = pmxArg ?? pmxOf(id);
   const pmxTextures = await readPmxTextures(pmxPath ? path.resolve(pmxPath) : null);
@@ -235,7 +259,7 @@ for (const input of targets) {
   const matRecords = [];
   const texChannel = new Map(); // Texture → 通道（先到先得：同图多挂时取第一个语义）
   let roleCount = {};
-  let fixedMetal = 0, fixedAlpha = 0;
+  let fixedMetal = 0, fixedAlpha = 0, shaderMaterials = 0;
 
   for (const mat of root.listMaterials()) {
     const name = mat.getName() || '(未命名)';
@@ -336,6 +360,14 @@ for (const input of targets) {
       .filter(Boolean))];
     if (chans.length) charter.channels = chans;
 
+    // ⑧ 着色模块（模型级 → 族级 → 材质级合并去重）
+    //    只写 id，不写 GLSL：GLSL 归引擎/内容仓的代码，资产只声明意图。
+    const shader = resolveShader(id, role, name);
+    if (shader.ids.length) {
+      charter.shader = { modules: shader.ids };
+      shaderMaterials++;
+    }
+
     mat.setExtras({ ...(mat.getExtras() ?? {}), charter });
     matRecords.push({
       name,
@@ -351,7 +383,8 @@ for (const input of targets) {
       channels: chans,
       _texRefs: texRefs,
       faceGlow: charter.faceGlow,
-      flags: Object.keys(charter).filter((k) => !['version', 'role', 'track', 'layer', 'pmxOrder', 'srcName', 'hit', 'layerHit', 'faceGlow', 'channels'].includes(k)),
+      ...(shader.ids.length ? { shader: shader.ids } : {}),
+      flags: Object.keys(charter).filter((k) => !['version', 'role', 'track', 'layer', 'pmxOrder', 'srcName', 'hit', 'layerHit', 'faceGlow', 'channels', 'shader'].includes(k)),
     });
   }
 
@@ -433,6 +466,8 @@ for (const input of targets) {
       standRotY: meta.standRotY ?? null,
       faceSdf: meta.faceSdf ?? null,
       sourceOrder: 'pmx',
+      // 模型级着色（全身）：消费端 prepareCharacterRendering 读它，缺失的模块降级跳过
+      ...(modelShaderIds.length ? { shader: { modules: modelShaderIds } } : {}),
     },
   });
 
@@ -465,6 +500,7 @@ for (const input of targets) {
     faceGlow: meta.faceGlow ?? 0,
     faceSdf: meta.faceSdf ?? null,
     standPosition: meta.standPosition ?? null,
+    ...(modelShaderIds.length ? { shader: modelShaderIds } : {}),
     stats: { verts, tris: Math.round(tris), materials: matRecords.length, textures: texRecords.length, joints, mb },
     roles: roleCount,
     materials: matRecords,
@@ -487,6 +523,8 @@ for (const input of targets) {
   console.log(`材质 ${matRecords.length} · 贴图 ${texRecords.length} · 骨骼 ${joints} · 三角 ${Math.round(tris).toLocaleString()}`);
   console.log(`材质族: ${Object.entries(roleCount).map(([r, c]) => `${r}×${c}`).join('  ')}`);
   console.log(`归一: 金属归零 ${fixedMetal} · alpha 修正 ${fixedAlpha}`);
+  console.log(`着色声明: ${modelShaderIds.length ? `模型级 ${modelShaderIds.join('+')}` : '无模型级'}`
+    + ` · 命中材质 ${shaderMaterials}/${matRecords.length}`);
   console.log(`通道溯源: ${pmxTextures ? `${tracked}/${texRecords.length} 张对回终末地官方后缀（PMX ${path.basename(pmxPath ?? '')}）` : '无 PMX 源 → 按 glTF 槽位映射'}`);
   console.log(`贴图预算: 降采样 ${resized} 张${resizeLog.length ? `（${resizeLog.map((x) => `${x.rec.name} ${x.from}→${x.to}`).join(' · ')}）` : ''}`
     + (noResize ? '（--no-resize 已关）' : ` / 上限 ${BUDGET.maxTexSize}`));
@@ -497,6 +535,7 @@ for (const input of targets) {
     console.log('  ' + m.name.padEnd(16) + m.role.padEnd(9) + m.track.padEnd(9)
       + String(m.layer).padEnd(5) + m.hit.padEnd(10) + m.alphaMode.padEnd(10)
       + (m.channels.join('+') || '—')
+      + (m.shader ? `   ⟨${m.shader.join('+')}⟩` : '')
       + (m.flags.length ? `   [${m.flags.join(',')}]` : ''));
   }
   console.log('');

@@ -16,13 +16,15 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { createPostChain } from '../src/post';
+import { createToneMapPass, createEncodePass } from '../src/output-passes';
 import { loadCharacter, type CharacterHandles } from '../src/character';
 import { materialCharter } from '../src/charter';
-import { applyNprToObject, createNprUniforms, updateNprUniforms } from '../src/npr';
+import { createNprUniforms, updateNprUniforms } from '../src/npr';
+import { setQueue } from '../src/queue';
+import { prepareCharacterRendering, discardPreparedCharacter, faceSdfStatusText, type CharacterRendering } from '../src/character-rendering';
 import { buildStudio } from './studio';
 import {
   BUILTIN_POSES, PosePlayer, buildRig, loadRigManifest, mirrorOnto, mirrorPose,
@@ -95,11 +97,14 @@ controls.target.set(0, 0.85, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 
-const composer = new EffectComposer(renderer);
-composer.addPass(new RenderPass(scene, camera));
+// 后期走引擎的 PostChain（与舞台同一条链）：动作台原来没有调色，
+// 这里也只装 Bloom + 输出两段——并轨不改观感，改的是「谁定义顺序」。
+const post = createPostChain(renderer, { width: 1, height: 1, samples: 0, type: THREE.HalfFloatType });
+post.add(new RenderPass(scene, camera), { id: 'scene', anchor: 'scene', priority: 0, locked: true });
 const bloom = new UnrealBloomPass(new THREE.Vector2(2, 2), 0.2, 0.55, 0.74);
-composer.addPass(bloom);
-composer.addPass(new OutputPass());
+post.add(bloom, { id: 'bloom', anchor: 'beforeTonemap', priority: 10 });
+post.add(createToneMapPass(), { id: 'tonemap', anchor: 'tonemap', priority: 0, locked: true, internal: true });
+post.add(createEncodePass(), { id: 'encode', anchor: 'encode', priority: 0, locked: true, internal: true });
 
 const editNpr = createNprUniforms();
 
@@ -109,6 +114,8 @@ const editNpr = createNprUniforms();
 
 let manifest: RigManifest | null = null;
 let character: CharacterHandles | null = null;
+let characterRendering: CharacterRendering | null = null;
+let loadGeneration = 0;
 let rig: Rig | null = null;
 let player: PosePlayer | null = null;
 
@@ -144,7 +151,7 @@ const highlight = new THREE.Mesh(
   new THREE.SphereGeometry(0.03, 12, 12),
   new THREE.MeshBasicMaterial({ color: 0xe8a34c, depthTest: false, transparent: true }),
 );
-highlight.renderOrder = 11;
+setQueue(highlight, 'overlay', 2);
 highlight.visible = false;
 scene.add(highlight);
 
@@ -171,6 +178,8 @@ function scaleFaceGlow(root: THREE.Object3D) {
 
 function disposeCharacter() {
   if (!character) return;
+  characterRendering?.dispose();
+  characterRendering = null;
   scene.remove(character.group);
   if (skelHelper) { scene.remove(skelHelper); skelHelper.dispose(); skelHelper = null; }
   if (jointPoints) { scene.remove(jointPoints); jointPoints.geometry.dispose(); jointPoints = null; }
@@ -187,29 +196,57 @@ function disposeCharacter() {
 }
 
 async function loadModel(id: string) {
+  const generation = ++loadGeneration;
   disposeCharacter();
+  $('stats').textContent = '加载角色与 SDF…';
   if (!manifest) return;
   const model = manifest.models.find((m) => m.id === id);
   if (!model) { $('stats').textContent = `manifest 里没有 ${id}`; return; }
 
   try {
-    character = await loadCharacter(id);
+    const loaded = await loadCharacter(id);
+    const prepared = await prepareCharacterRendering(loaded, editNpr);
+    if (generation !== loadGeneration) {
+      discardPreparedCharacter(loaded, prepared);
+      return;
+    }
+    character = loaded;
+    characterRendering = prepared;
   } catch (e) {
-    $('stats').textContent = '加载失败: ' + e;
+    if (generation === loadGeneration) $('stats').textContent = '加载失败: ' + e;
     return;
   }
   // 编辑器：回原点，用模型自带的摆正角（各包正面朝向不同）
   character.group.position.set(0, 0, 0);
   character.group.rotation.y = character.defaultRotY ?? 0;
+  // 调试参数 ?noshadow=1：关闭模型自阴影/受影（定位阴影 acne 时用）
+  const noShadow = new URLSearchParams(location.search).get('noshadow') === '1';
   character.group.traverse((o) => {
     const m = o as THREE.Mesh;
-    if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; }
+    if (m.isMesh) { m.castShadow = !noShadow; m.receiveShadow = !noShadow; }
   });
   scene.add(character.group);
 
+  // 调试句柄：控制台可拿 scene / 当前模型（定位渲染问题时用）
+  (window as any).__pose = { get character() { return character; }, scene, THREE };
+
   // 契约轨道（与主工程同一套着色）+ 面部自发光按浅棚缩放
-  applyNprToObject(character.group, editNpr);
+  characterRendering!.apply();
   scaleFaceGlow(character.group);
+  // 参数必须在 NPR 创建之后应用，否则转换过程会重新启用阴影。
+  if (noShadow) character.group.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (m.isMesh) { m.castShadow = false; m.receiveShadow = false; }
+  });
+
+  // 调试参数 ?noshell=1：隐藏「发轮廓线」描边壳（定位描边壳渲染问题时用）
+  if (new URLSearchParams(location.search).get('noshell') === '1') {
+    character.group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      const mats = Array.isArray(m.material) ? m.material : [m.material];
+      if (mats.some((x) => x && x.name === '发轮廓线')) m.visible = false;
+    });
+  }
 
   // 骨骼契约
   rig = buildRig(character.group, model);
@@ -221,7 +258,7 @@ async function loadModel(id: string) {
   // 骨架 / 关节点
   skelHelper = new THREE.SkeletonHelper(character.group);
   (skelHelper.material as THREE.LineBasicMaterial).depthTest = false;
-  skelHelper.renderOrder = 9;
+  setQueue(skelHelper, 'overlay', 0);
   skelHelper.visible = showSkel;
   scene.add(skelHelper);
 
@@ -231,7 +268,7 @@ async function loadModel(id: string) {
   jointPoints = new THREE.Points(jg, new THREE.PointsMaterial({
     color: 0x53e0c8, size: 0.022, sizeAttenuation: true, depthTest: false, transparent: true, opacity: 0.9,
   }));
-  jointPoints.renderOrder = 10;
+  setQueue(jointPoints, 'overlay', 1);
   jointPoints.visible = showJoints;
   scene.add(jointPoints);
 
@@ -254,7 +291,7 @@ async function loadModel(id: string) {
   renderClip();
   updateAnimButtons();
   $('stats').innerHTML =
-    `骨架 <b>${model.stats.joints}</b> · 有权重 <b>${model.stats.weighted}</b> · 槽位 <b>${Object.keys(model.slots).length}</b>`
+    `${faceSdfStatusText(characterRendering!.faceSdf)}<br>骨架 <b>${model.stats.joints}</b> · 有权重 <b>${model.stats.weighted}</b> · 槽位 <b>${Object.keys(model.slots).length}</b>`
     + ` · 物理骨 ${model.stats.physBones}（${(model.stats.physVerts / 1000).toFixed(0)}k 权重顶点）`
     + `<br>未解析槽位 ${model.unresolvedSlots.length ? `<span style="color:#d86a6a">${model.unresolvedSlots.join(',')}</span>` : '无 → 全部命中'}`;
 }
@@ -704,7 +741,7 @@ function resize() {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
-  composer.setSize(w, h);
+  post.setSize(w, h);
 }
 window.addEventListener('resize', resize);
 
@@ -734,7 +771,7 @@ function loop() {
   }
 
   controls.update();
-  composer.render();
+  post.render(dt);
   requestAnimationFrame(loop);
 }
 
@@ -758,6 +795,7 @@ window.__poseLab = {
   get controls() { return controls; },
   get rig() { return rig; },
   get player() { return player; },
+  get rendering() { return characterRendering; },
   meshOf: (matName: string) => {
     const out: THREE.Mesh[] = [];
     character?.group.traverse((o) => {
@@ -787,7 +825,11 @@ window.__poseLab = {
   } else {
     sel.innerHTML = manifest.models
       .map((m) => `<option value="${m.id}">${m.name ? `${m.name} · ` : ''}${m.id}</option>`).join('');
-    await loadModel(manifest.models[0].id);
+    // ?model= 深链：直接加载指定模型（调试对照用）
+    const modelParam = new URLSearchParams(location.search).get('model');
+    const firstId = modelParam && manifest.models.some((m) => m.id === modelParam) ? modelParam : manifest.models[0].id;
+    sel.value = firstId;
+    await loadModel(firstId);
   }
   sel.addEventListener('change', () => { loadModel(sel.value).catch(console.error); });
 

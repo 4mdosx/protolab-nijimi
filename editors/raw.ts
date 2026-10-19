@@ -9,6 +9,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import type { CharacterHandles } from '../src/character';
+import { ExpProtocol } from '../src/exp-protocol';
 
 const loader = new GLTFLoader();
 
@@ -51,6 +52,7 @@ export async function loadRawModel(id: string, opts: RawLoadOptions = {}): Promi
     group,
     position: group.position,
     mixer: null,
+    exp: new ExpProtocol({ expr: null, slots: {}, modelId: id }),
     defaultRotY,
     charter: null,
     report: { bound: 0, unbound: [], roles: {}, modelId: null, morphOnlyHidden: [] },

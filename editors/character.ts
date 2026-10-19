@@ -20,11 +20,11 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { createPostChain } from '../src/post';
+import { createToneMapPass, createEncodePass } from '../src/output-passes';
 import { loadCharacter, loadChibiWitch, type CharacterHandles } from '../src/character';
 import { channelOfTexture, materialCharter, type CharterMaterial } from '../src/charter';
 import {
@@ -35,8 +35,11 @@ import {
   type MaterialRole,
   type NprUniforms,
 } from '../src/npr';
+import { prepareCharacterRendering, discardPreparedCharacter, faceSdfStatusText, type CharacterRendering } from '../src/character-rendering';
+import { setQueue } from '../src/queue';
 import { loadRawModel } from './raw';
 import { buildStudio } from './studio';
+import type { ExpCommand, ExpNotice } from '../src/exp-contract';
 
 // ---------- 基础（渲染配置与主工程一致） ----------
 
@@ -189,15 +192,24 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.autoRotateSpeed = 1.2;
 
-// ---- Bloom（与主工程同参）----
-const composer = new EffectComposer(renderer);
-composer.addPass(new RenderPass(scene, camera));
+// ---- 后期：走引擎的 PostChain（与舞台同一条链，不再自建 EffectComposer）----
+// 这里**刻意保留**编辑器原有的观感：不开 MSAA（samples 0）、HDR 半浮点、
+// Bokeh 在 Bloom 之前——并轨是为了「编辑器看到的 = 运行时看到的」，
+// 不是为了顺手改画面。锚点与舞台一致：beforeTonemap → tonemap → encode。
+const post = createPostChain(renderer, {
+  width: 1,
+  height: 1,
+  samples: 0,
+  type: THREE.HalfFloatType,
+});
+post.add(new RenderPass(scene, camera), { id: 'scene', anchor: 'scene', priority: 0, locked: true });
 // 景深：焦点实时锁在轨道目标（角色），坡度放缓——近处地面保持锐利，远处才糊进天空
 const bokehPass = new BokehPass(scene, camera, { focus: 4.0, aperture: 0.0012, maxblur: 0.008 });
-composer.addPass(bokehPass);
+post.add(bokehPass, { id: 'bokeh', anchor: 'beforeTonemap', priority: 5 });
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(2, 2), 0.62, 0.55, 0.74);
-composer.addPass(bloomPass);
-composer.addPass(new OutputPass());
+post.add(bloomPass, { id: 'bloom', anchor: 'beforeTonemap', priority: 10 });
+post.add(createToneMapPass(), { id: 'tonemap', anchor: 'tonemap', priority: 0, locked: true, internal: true });
+post.add(createEncodePass(), { id: 'encode', anchor: 'encode', priority: 0, locked: true, internal: true });
 
 /* ------------------------------------------------------------------ *
  * 材质查看器：独立小 renderer + 材质球（球 / 平面两种载体）
@@ -299,7 +311,8 @@ const wireMat = new THREE.MeshBasicMaterial({ color: 0x8a7fae, wireframe: true }
 // ---- 契约轨道（NPR 注入）----
 // 与主工程同一套 uniforms；主视图用的编辑器相机与 key 灯每帧回写（方向接线）。
 const editNpr: NprUniforms = createNprUniforms();
-let curFaceSdf: THREE.Texture | null = null;
+let characterRendering: CharacterRendering | null = null;
+let loadGeneration = 0;
 
 function disposeCharacter() {
   if (!character) return;
@@ -318,7 +331,8 @@ function disposeCharacter() {
   unlitPool.clear();
   for (const t of trackPool.values()) (Array.isArray(t) ? t : [t]).forEach((m) => m.dispose());
   trackPool.clear();
-  curFaceSdf = null;
+  characterRendering?.dispose();
+  characterRendering = null;
   character = null;
   bones = [];
 }
@@ -638,23 +652,171 @@ function renderCharterPanel(h: CharacterHandles) {
   selectMaterial(parseInt(sel.value, 10));
 }
 
+/* ------------------------------------------------------------------ *
+ * 表情面板：槽位滑条（数据来自 expression-manifest.json，不硬编码）
+ *
+ * 这是表情契约的「最终消费者视图」：滑条 = 语义槽位，动的却是 morph target
+ * 与材质叠加层。滑条列表随模型变化——同一套槽位名在 si 上做不了的会标出来。
+ * ------------------------------------------------------------------ */
+
+function renderExpressionPanel(h: CharacterHandles | null) {
+  const group = $('exprGroup');
+  const host = $('exprSlots');
+  const info = $('exprInfo');
+  const expr = h?.expression ?? null;
+  if (!expr) {
+    group.style.display = 'none';
+    return;
+  }
+  group.style.display = '';
+
+  const rows: string[] = [];
+  for (const g of expr.groups) {
+    const slots = Object.keys(expr.slots).filter((s) => expr.slots[s].group === g && expr.has(s));
+    if (!slots.length) continue;
+    rows.push(`<div class="title" style="opacity:.55;font-size:10px;margin:8px 0 2px">${g}</div>`);
+    for (const s of slots) {
+      const cn = expr.slots[s].cn;
+      rows.push(
+        `<div class="row"><label title="${s}">${cn}</label>`
+        + `<input type="range" data-slot="${s}" min="0" max="1" step="0.01" value="0" />`
+        + `<span class="val" data-val="${s}">0.00</span></div>`,
+      );
+    }
+  }
+  host.innerHTML = rows.join('');
+  for (const inp of host.querySelectorAll<HTMLInputElement>('input[type="range"]')) {
+    inp.addEventListener('input', () => {
+      const slot = inp.dataset.slot as string;
+      const v = parseFloat(inp.value);
+      expr.set(slot, v);
+      const out = host.querySelector(`[data-val="${slot}"]`);
+      if (out) out.textContent = v.toFixed(2);
+    });
+  }
+
+  const cov = expr.model.coverage;
+  info.innerHTML = `覆盖 ${cov?.covered ?? 0}/${cov?.total ?? 0} 槽位 · target ${expr.model.targets?.length ?? 0}`
+    + (expr.model.unresolved.length
+      ? `<br><span style="opacity:.55">做不了：${expr.model.unresolved.join(' ')}</span>`
+      : '');
+  $('exprBlink').classList.toggle('on', expr.autoBlink);
+}
+
+/* ------------------------------------------------------------------ *
+ * 指令面板：witch.exp/1
+ *
+ * 这一块是**契约的活体验证**：点一条指令，看脸怎么动、日志怎么报。
+ * 尤其「汗（演示回退）」—— si 没有 symbol_sweat，正确行为是回退到中性
+ * 并发一条 slot-neutral，而不是什么都不发生。
+ * ------------------------------------------------------------------ */
+
+const CMD_PRESETS: { label: string; cmd: ExpCommand | Record<string, unknown> }[] = [
+  { label: '开心', cmd: { op: 'emote', slot: 'happy', hold: 2.2 } },
+  { label: '生气', cmd: { op: 'emote', slot: 'angry', hold: 2.0 } },
+  { label: '难过', cmd: { op: 'emote', slot: 'sad', hold: 2.0 } },
+  { label: '惊讶', cmd: { op: 'emote', slot: 'surprised', hold: 1.4 } },
+  { label: '害羞', cmd: { op: 'emote', slot: 'shy', hold: 2.4 } },
+  { label: '汗→回退', cmd: { op: 'emote', slot: 'symbol_sweat' } },
+  { label: '看右', cmd: { op: 'gaze.dir', x: 1, y: 0 } },
+  { label: '看左上', cmd: { op: 'gaze.dir', x: -0.7, y: 0.7 } },
+  { label: '视线游移', cmd: { op: 'face.auto', what: 'gaze', on: true } },
+  { label: '挥手(无动作库)', cmd: { op: 'emote', slot: 'happy', motion: 'wave' } },
+  { label: '归零', cmd: { op: 'reset' } },
+];
+
+function pushNotice(n: ExpNotice | { code: string; level: string; detail: string }) {
+  const log = $('cmdLog');
+  const row = document.createElement('div');
+  row.className = 'n ' + n.level;
+  row.innerHTML = `<span class="c">${n.code}</span> ${n.detail}`;
+  log.prepend(row);
+  while (log.childElementCount > 30) log.lastElementChild?.remove();
+}
+
+function sendCmd(raw: string | unknown) {
+  const exp = character?.exp;
+  if (!exp) return;
+  let cmd: unknown = raw;
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return;
+    try { cmd = JSON.parse(raw); } catch (e) {
+      pushNotice({ code: 'unknown-op', level: 'warn', detail: `JSON 解析失败：${e}` });
+      return;
+    }
+    $inp('cmdInput').value = raw;
+  }
+  exp.apply(cmd as ExpCommand);
+}
+
+function renderCmdPanel(h: CharacterHandles | null) {
+  const group = $('cmdGroup');
+  if (!h) { group.style.display = 'none'; return; }
+  group.style.display = '';
+
+  const exp = h.exp;
+  exp.setNoticeSink(pushNotice);
+  exp.clearNotices();
+  $('cmdLog').innerHTML = '';
+
+  const caps = exp.capabilities;
+  const parts: string[] = [];
+  if (caps) {
+    parts.push(`能做 <b>${caps.slots.length}</b>/${caps.slots.length + caps.missing.length} 槽位`);
+    parts.push(`视线 <b>${caps.gaze.mode}</b>${caps.gaze.maxDeg ? ` ±${caps.gaze.maxDeg}°` : ''}`);
+    if (caps.gaze.bones?.length) parts.push(`眼骨 ${caps.gaze.bones.join('/')}`);
+    parts.push(caps.blink ? '自动眨眼' : '<span style="color:#d86a6a">无眨眼</span>');
+    if (caps.material) parts.push('材质通道');
+    if (caps.missing.length) {
+      const byG = new Map<string, number>();
+      for (const s of caps.missing) {
+        const g = caps.byGroup ? Object.keys(caps.byGroup).find((k) => caps.byGroup[k].missing.includes(s)) : '';
+        byG.set(g || '?', (byG.get(g || '?') ?? 0) + 1);
+      }
+      parts.push(`<span style="color:#8a6a4a">缺 ${[...byG].map(([g, n]) => `${g}${n}`).join(' ')}</span>`);
+    }
+  } else {
+    parts.push('<span style="color:#d86a6a">该模型没有表情契约</span>');
+  }
+  $('cmdCaps').innerHTML = parts.join(' · ');
+
+  const host = $('cmdPresets');
+  host.innerHTML = CMD_PRESETS.map((p, i) => `<button data-i="${i}">${p.label}</button>`).join('');
+  for (const btn of host.querySelectorAll<HTMLButtonElement>('button')) {
+    btn.addEventListener('click', () => sendCmd(CMD_PRESETS[parseInt(btn.dataset.i as string, 10)].cmd));
+  }
+}
+
 async function loadModel(kind: ModelKind) {
+  const generation = ++loadGeneration;
   disposeCharacter();
+  $('stats').textContent = '加载角色与 SDF…';
+  let loaded: CharacterHandles;
+  // 下拉框跟着变 —— 自动化会绕过 <select> 直接调本函数，不同步的话面板标题会停在旧模型
+  const modelSel = $sel('model');
+  if ([...modelSel.options].some((o) => o.value === kind)) modelSel.value = kind;
   try {
     if (kind === 'witch') {
-      character = await loadChibiWitch();
+      loaded = await loadChibiWitch();
     } else if (kind.startsWith('r:')) {
       const id = kind.slice(2);
       const mm = manifestOf(id);
-      character = await loadRawModel(id, {
+      loaded = await loadRawModel(id, {
         targetHeight: mm?.targetHeight,
         defaultRotY: mm?.defaultRotY,
       });
     } else {
-      character = await loadCharacter(kind.slice(2));
+      loaded = await loadCharacter(kind.slice(2));
     }
+    const prepared = await prepareCharacterRendering(loaded, editNpr);
+    if (generation !== loadGeneration) {
+      discardPreparedCharacter(loaded, prepared);
+      return;
+    }
+    character = loaded;
+    characterRendering = prepared;
   } catch (e) {
-    $('stats').textContent = '加载失败: ' + e;
+    if (generation === loadGeneration) $('stats').textContent = '加载失败: ' + e;
     return;
   }
   // 编辑器: 摆回原点，朝向/缩放交给控件（loadXxx 里的房间站位在此无效）
@@ -667,24 +829,20 @@ async function loadModel(kind: ModelKind) {
   $('rotYVal').textContent = `${deg}°`;
   scene.add(character.group);
 
+  // 表情层先跑一帧 dt=0：口内件（morphOnly）此刻按「嘴闭」隐藏，
+  // 随后 captureVisibility 抓到的可见性基线才是对的（否则隔离模式会把嘴里的牙重新打开）
+  character.expression?.update(0);
+
+  // 调试句柄：控制台可拿 scene / 当前模型（定位渲染问题时用）
+  (window as any).__char = { get character() { return character; }, scene, THREE, origMaterials, editNpr };
+
   // 记录原始材质，供模式切换
   character.group.traverse((o) => {
     const m = o as THREE.Mesh;
     if (m.isMesh) origMaterials.set(m, m.material);
   });
-  // 契约自发光按当前灯光预设缩放（模型加载晚于预设切换时补齐）
-  applyFaceGlow();
-
-  // 面部 SDF（契约 faceSdf → /models/<file>）：契约轨道模式用它做 SDF 明暗
-  curFaceSdf = null;
-  if (character.charter?.faceSdf) {
-    try {
-      curFaceSdf = await new THREE.TextureLoader().loadAsync(`/models/${character.charter.faceSdf}`);
-      curFaceSdf.colorSpace = THREE.NoColorSpace;
-    } catch (e) {
-      console.warn(`[sdf] ${character.charter.faceSdf} 加载失败（face 退回普通 NPR 明暗）`, e);
-    }
-  }
+  // 准备完成后按用户选择创建材质，再应用编辑器参数。
+  applyMaterialMode();
 
   // 骨架
   const skinned = (character.group.getObjectByProperty('type', 'SkinnedMesh') ??
@@ -699,7 +857,7 @@ async function loadModel(kind: ModelKind) {
   jointPoints = new THREE.Points(jg, new THREE.PointsMaterial({
     color: 0x53e0c8, size: 0.022, sizeAttenuation: true, depthTest: false, transparent: true, opacity: 0.9,
   }));
-  jointPoints.renderOrder = 10;
+  setQueue(jointPoints, 'overlay', 1);
   jointPoints.visible = false;
   scene.add(jointPoints);
 
@@ -728,7 +886,7 @@ async function loadModel(kind: ModelKind) {
     return n;
   })();
   $('stats').innerHTML =
-    `骨骼 ${bones.length} · 顶点 ${vertCount.toLocaleString()} · 材质 ${origMaterials.size}` +
+    `${faceSdfStatusText(characterRendering!.faceSdf)}<br>骨骼 ${bones.length} · 顶点 ${vertCount.toLocaleString()} · 材质 ${origMaterials.size}` +
     (skeleton ? '' : '<br>⚠ 无骨架（网格手术模型）');
   if (character.report.bound || character.report.unbound.length) {
     $('stats').innerHTML += `<br>契约命中 ${character.report.bound}`
@@ -740,6 +898,8 @@ async function loadModel(kind: ModelKind) {
   $('matIso').classList.remove('on');
   captureVisibility(character.group);
   renderCharterPanel(character);
+  renderExpressionPanel(character);
+  renderCmdPanel(character);
 }
 
 // 选中骨骼高亮球
@@ -747,7 +907,7 @@ const highlight = new THREE.Mesh(
   new THREE.SphereGeometry(0.03, 12, 12),
   new THREE.MeshBasicMaterial({ color: 0xe8a34c, depthTest: false, transparent: true }),
 );
-highlight.renderOrder = 11;
+setQueue(highlight, 'overlay', 2);
 
 // ---------- 控件 ----------
 
@@ -759,7 +919,7 @@ function setSkelVisible(on: boolean) {
   if (on && !skelHelper && character) {
     skelHelper = new THREE.SkeletonHelper(character.group);
     (skelHelper.material as THREE.LineBasicMaterial).depthTest = false;
-    skelHelper.renderOrder = 9;
+    setQueue(skelHelper, 'overlay', 0);
     scene.add(skelHelper);
   }
   if (skelHelper) skelHelper.visible = on;
@@ -787,6 +947,33 @@ $inp('bone').addEventListener('change', () => {
 
 $('model').addEventListener('change', () => {
   loadModel($inp('model').value as ModelKind).catch((e) => { $('stats').textContent = '加载失败: ' + e; });
+});
+
+/* ---------- 指令面板控件 ---------- */
+
+$('cmdSend').addEventListener('click', () => sendCmd($inp('cmdInput').value));
+$inp('cmdInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendCmd($inp('cmdInput').value);
+});
+
+/* ---------- 表情面板控件 ---------- */
+
+$('exprBlink').addEventListener('click', () => {
+  const e = character?.expression;
+  if (!e) return;
+  e.setAutoBlink(!e.autoBlink);
+  $('exprBlink').classList.toggle('on', e.autoBlink);
+});
+
+$('exprClear').addEventListener('click', () => {
+  const e = character?.expression;
+  if (!e) return;
+  e.clear();
+  for (const inp of document.querySelectorAll<HTMLInputElement>('#exprSlots input[type="range"]')) {
+    inp.value = '0';
+    const out = document.querySelector(`#exprSlots [data-val="${inp.dataset.slot}"]`);
+    if (out) out.textContent = '0.00';
+  }
 });
 
 /* ---------- 材质查看器控件 ---------- */
@@ -850,7 +1037,7 @@ $inp('rotY').addEventListener('input', () => {
   $('rotYVal').textContent = `${deg}°`;
 });
 
-$inp('matmode').addEventListener('change', () => {
+function applyMaterialMode() {
   const mode = $inp('matmode').value;
   for (const [mesh, orig] of origMaterials) {
     switch (mode) {
@@ -861,7 +1048,7 @@ $inp('matmode').addEventListener('change', () => {
         let t = trackPool.get(mesh);
         if (!t) {
           const src = Array.isArray(orig) ? orig : [orig];
-          const conv = src.map((m) => toNprMaterial(m.clone(), editNpr, { stylizeMetal: false, faceSdf: curFaceSdf }));
+          const conv = src.map((m) => characterRendering!.createMaterial(m));
           t = Array.isArray(orig) ? conv : conv[0];
           trackPool.set(mesh, t);
         }
@@ -884,7 +1071,9 @@ $inp('matmode').addEventListener('change', () => {
       case 'wire': mesh.material = wireMat; break;
     }
   }
-});
+  applyFaceGlow();
+}
+$inp('matmode').addEventListener('change', applyMaterialMode);
 
 function bindSlider(id: string, valId: string, apply: (v: number) => void) {
   const inp = $inp(id);
@@ -944,7 +1133,7 @@ function resize() {
   const w = container.clientWidth || 1;
   const h = container.clientHeight || 1;
   renderer.setSize(w, h);
-  composer.setSize(w, h);
+  post.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -952,8 +1141,12 @@ resize();
 window.addEventListener('resize', resize);
 
 const tmp = new THREE.Vector3();
+let lastFrameT = performance.now();
 function loop() {
   requestAnimationFrame(loop);
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - lastFrameT) / 1000);
+  lastFrameT = now;
   controls.update();
   // 景深焦点跟随轨道目标（角色永远清晰，远处地面糊化）
   (bokehPass.uniforms as Record<string, { value: number }>)['focus'].value =
@@ -974,7 +1167,10 @@ function loop() {
     highlight.position.copy(tmp);
   }
 
-  composer.render();
+  // 表情层：与骨架同一时基推进（此处用真实 dt，淡化更顺；上限 0.1s 防切页回跳）
+  character?.expression?.update(dt);
+
+  post.render(dt);
 
   // NPR 注入项每帧回写：编辑器相机 + key 灯方向（uNprKeyDir 接线，face SDF 依赖它）
   updateNprUniforms(editNpr, camera, key);
@@ -1012,10 +1208,14 @@ Object.assign(window, {
     lights: { key, hemi, ambient, moon, fill, rim },
     character: () => character,
     bones: () => bones,
+    expr: () => character?.expression ?? null,
+    /** witch.exp/1 指令入口 —— 自动化脚本用它验证回退与提示 */
+    exp: () => character?.exp ?? null,
     manifest: () => manifest,
     loadModel,
     // 面部 SDF 管路诊断（自动化/控制台驱动用）
-    faceSdf: () => curFaceSdf,
+    faceSdf: () => characterRendering?.faceSdf.texture ?? null,
+    rendering: () => characterRendering,
     trackPoolSize: () => trackPool.size,
     // 材质查看器（自动化/控制台驱动用）
     materials: () => matIndex,
