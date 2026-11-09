@@ -66,3 +66,6 @@ export * from './scenes/workshop';
  * 因为「场景里长什么样」本来就属于内容职责（见 scenes/types.ts）。
  */
 export * as THREE from 'three';
+
+/* 舞台视觉预设：无 Three.js 依赖的数据契约 */
+export * from './visual-preset';

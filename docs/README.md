@@ -37,6 +37,10 @@ node pipeline/pmx2glb.mjs <pmx> assets/models/<id>.glb --name <id> --expr --mode
 npm run charter && npm run expr      # 契约版（继承 morph）+ 表情契约
 ```
 
+## 当前执行路线
+
+当前目标：用 nijimi 完成并发布固定场景风格化小游戏，同期完成 Unreal 对应样例并参与真实协作。范围、阶段和验收唯一见 [ROADMAP](ROADMAP.md)。近期执行见 [实施计划](IMPLEMENTATION-PLAN.md)，已开发功能用法见 [视觉预设](视觉预设.md)。先做视觉与玩法闭环，按需要提取引擎能力；下面的技术文档说明既有接口，历史评估不自动代表当前状态。
+
 ## 设计文档
 
 | 文档 | 说什么 |

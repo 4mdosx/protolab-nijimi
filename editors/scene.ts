@@ -1,11 +1,12 @@
 /**
  * 场景编辑器：createStage(withCharacter:false) 的纯环境调试台。
- * 调灯光 / 后期 / NPR / 视窗——参数标定后回写 src/stage.ts 的默认值。
+ * 调灯光 / 后期 / NPR / 视窗；视觉配置通过预设导出，不改引擎默认值。
  */
 
 import * as THREE from 'three';
 import { createStage } from '../src/stage';
 import { applyBackdrop } from './studio';
+import { mountScenePresets } from './scene-presets';
 
 const container = document.getElementById('viewport')!;
 const s = createStage(container, { withCharacter: false, softParticles: { scale: 0.5 } });
@@ -40,7 +41,7 @@ bindSlider('bloom', 'bloomVal', f2, (v) => { D.bloomPass.strength = v; });
 bindSlider('exposure', 'exposureVal', f2, (v) => { s.renderer.toneMappingExposure = v; });
 
 const nprBtn = $('toggleNpr');
-let nprOn = true;
+let nprOn = s.visual.capture().npr;
 nprBtn.addEventListener('click', () => {
   nprOn = !nprOn;
   s.setNpr(nprOn);
@@ -49,13 +50,36 @@ nprBtn.addEventListener('click', () => {
 });
 
 const bloomBtn = $('toggleBloom');
-let bloomOn = true;
+let bloomOn = s.visual.capture().bloom.enabled;
 bloomBtn.addEventListener('click', () => {
   bloomOn = !bloomOn;
   s.setBloom(bloomOn);
   bloomBtn.classList.toggle('on', bloomOn);
   bloomBtn.textContent = `Bloom 通路：${bloomOn ? '开' : '关'}`;
 });
+
+function refreshVisualControls() {
+  const p = s.visual.capture();
+  const values: Record<string, number> = {
+    key: p.lights.key.intensity, hemi: p.lights.hemi.intensity * 2,
+    moon: p.lights.moon.intensity, fill: p.lights.fill.intensity,
+    bloom: p.bloom.strength, exposure: p.exposure,
+  };
+  for (const [id, value] of Object.entries(values)) {
+    const input = $inp(id);
+    input.min = String(Math.min(Number(input.min), value));
+    input.max = String(Math.max(Number(input.max), value));
+    input.value = String(value);
+    $(id + 'Val').textContent = id === 'fill' ? value.toFixed(1) : value.toFixed(2);
+  }
+  nprOn = p.npr; bloomOn = p.bloom.enabled;
+  nprBtn.classList.toggle('on', nprOn);
+  nprBtn.textContent = `NPR 手法：${nprOn ? '开' : '关'}`;
+  bloomBtn.classList.toggle('on', bloomOn);
+  bloomBtn.textContent = `Bloom 通路：${bloomOn ? '开' : '关'}`;
+}
+mountScenePresets(s.visual, refreshVisualControls);
+refreshVisualControls();
 
 $('resetView').addEventListener('click', () => s.view.reset());
 

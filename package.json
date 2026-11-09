@@ -26,7 +26,8 @@
     "demo-anim": "node pipeline/make-demo-anim.mjs",
     "glb-audit": "node pipeline/glb-audit.mjs",
     "check:render-modules": "node pipeline/render-modules-check.mjs",
-    "check:render": "npm run check:character-rendering && npm run check:render-modules"
+    "check:render": "npm run check:character-rendering && npm run check:render-modules",
+    "check:visual-preset": "node pipeline/visual-preset-check.mjs"
   },
   "dependencies": {
     "three": "^0.186.1"

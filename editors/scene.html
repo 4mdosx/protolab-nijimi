@@ -43,7 +43,7 @@
       display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
     }
     #panel .row label { width: 76px; color: #a89c88; flex: none; font-size: 11px; }
-    #panel input[type="range"] { flex: 1; accent-color: #e8a34c; }
+    #panel input[type="range"] { flex: 1; min-width: 0; width: 0; accent-color: #e8a34c; }
     #panel .val { width: 38px; text-align: right; color: #7ec8c0; font-size: 11px; flex: none; }
     #panel button {
       font: inherit; color: #e8ddc8; background: #2e2839;
@@ -85,6 +85,16 @@
     <div class="group">
       <label>视窗 / VIEW</label>
       <button id="resetView">复位视角</button>
+    </div>
+    <div class="group">
+      <label>视觉预设 / PRESETS</label>
+      <button id="savePreset">保存到此浏览器</button>
+      <button id="loadPreset">恢复保存的预设</button>
+      <button id="exportPreset">导出 JSON</button>
+      <button id="importPreset">导入 JSON</button>
+      <button id="resetPreset">恢复默认视觉</button>
+      <input id="presetFile" type="file" accept=".json,application/json" hidden />
+      <p id="presetStatus" role="status" aria-live="polite" style="font-size:11px;line-height:1.5;margin-top:8px;overflow-wrap:anywhere"></p>
     </div>
     <div class="foot"><a href="/">← 返回编辑器总览</a></div>
   </div>

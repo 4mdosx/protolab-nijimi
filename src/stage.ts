@@ -30,6 +30,8 @@
  */
 
 import * as THREE from 'three';
+import { bindStageVisual } from './stage-visual';
+import { parseVisualPreset, type VisualPreset, type VisualPresetController } from './visual-preset';
 import { loadCharacter, loadProps, disposeCharacter, type CharacterHandles, type LoadCharacterOptions } from './character';
 import { prepareCharacterRendering, type CharacterRendering } from './character-rendering';
 import { createPerformer, type Performer } from './performance';
@@ -163,6 +165,8 @@ export interface Stage<H = unknown> {
    * （编辑器里三套 composer 已经让「编辑器看到的」和「运行时看到的」不是同一张画）。
    */
   post: PostChain;
+  /** 舞台灯光与后期的版本化预设；不保存相机或场景内容。 */
+  visual: VisualPresetController;
   resize(): void;
   /** 视窗 rig：虚拟视窗（box）内缩放 / 平移，窗口本身大小不变 */
   view: {
@@ -271,6 +275,8 @@ export interface Stage<H = unknown> {
 }
 
 export interface StageOptions<H> {
+  /** 校验后应用舞台灯光与后期预设；非法数据在创建 GPU 资源前拒绝。 */
+  visualPreset?: VisualPreset;
   /** 内容包（省略 = 引擎自带示例：工坊 diorama） */
   pack?: ScenePack<H>;
   /** 加载角色与陈设（默认 true；场景编辑器关掉它做纯环境调试） */
@@ -320,6 +326,7 @@ export function createStage<H = unknown>(
   container: HTMLElement,
   opts: StageOptions<H> = {},
 ): Stage<H> {
+  const initialVisual = opts.visualPreset === undefined ? undefined : parseVisualPreset(opts.visualPreset);
   const pack = (opts.pack ?? (workshopScene as unknown as ScenePack<H>));
   const {
     withCharacter = true,
@@ -361,7 +368,8 @@ export function createStage<H = unknown>(
   // 「暖光是画面唯一高饱和区」白捡构图焦点（融合定稿 §2.6）。
   const hemi = new THREE.HemisphereLight(0x565a8a, 0x241d2e, 0.5);
   scene.add(hemi);
-  scene.add(new THREE.AmbientLight(0x3a3355, 0.55));
+  const ambient = new THREE.AmbientLight(0x3a3355, 0.55);
+  scene.add(ambient);
 
   // 主光：暖色方向光（斜射，勾出黄铜与长袍的体积）
   const key = new THREE.DirectionalLight(0xffc890, 1.35);
@@ -619,7 +627,7 @@ export function createStage<H = unknown>(
       disposeCharacter(handles);
       return null;
     }
-    if (nprEnabled) rendering.apply();
+    rendering.apply();
     scene.add(handles.group);
 
     const manifest = await ensureManifest();
@@ -898,8 +906,18 @@ export function createStage<H = unknown>(
     canvas.remove();
   }
 
+  function setNpr(on: boolean) {
+    nprUniforms.uNprEnable.value = on ? 1 : 0;
+    scene.environmentIntensity = on ? 0.6 : 0;
+  }
+  const visual = bindStageVisual({
+    renderer, scene, hemi, ambient, key, moon, fill, bloom: bloomPass, grade: gradePass, post,
+    getNpr: () => nprUniforms.uNprEnable.value > 0.5, setNpr,
+  });
+  if (initialVisual) visual.apply(initialVisual);
+
   return {
-    renderer, camera, scene, content, raycaster, post, resize, view, render,
+    renderer, camera, scene, content, raycaster, post, resize, view, render, visual,
     params,
     depth,
     effects,
@@ -913,11 +931,7 @@ export function createStage<H = unknown>(
       return clock.context;
     },
     setBloom(on: boolean) { post.setEnabled('bloom', on); },
-    setNpr(on: boolean) {
-      nprUniforms.uNprEnable.value = on ? 1 : 0;
-      scene.environmentIntensity = on ? 0.6 : 0;
-      // 不碰 gradePass：NPR 是材质层，调色是后期层（耦合会导致「关 NPR」时整张画面换色）
-    },
+    setNpr,
 
     character: (id?: string) => (id ? slots.get(id)?.handles ?? null : primarySlot()?.handles ?? null),
     characterRendering: (id?: string) => (id ? slots.get(id)?.rendering ?? null : primarySlot()?.rendering ?? null),
