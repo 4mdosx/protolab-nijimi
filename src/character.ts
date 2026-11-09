@@ -18,6 +18,7 @@
 
 import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { modernMaterials, type ModernMaterials } from './materials';
 import { applyCharter, readModelCharter, type CharterModel, type CharterReport } from './charter';
 import { loadExpression, loadExpressionManifest, type ExpressionLayer } from './expression';
@@ -53,14 +54,145 @@ export interface CharacterHandles {
 /** 契约版资产路径（运行期唯一入口） */
 export const charterPath = (id: string) => `/models/${id}.charter.glb`;
 
-const gltfLoader = new GLTFLoader();
-function loadGLB(file: string): Promise<GLTF> {
-  // 以 / 开头 = 任意项目内路径（模型资产在 models/，拆包参考在 refs/，均已 gitignore，不进构建产物）
-  const url = file.startsWith('/') ? file : `/assets/models/${file}`;
-  return new Promise((resolve, reject) => {
-    gltfLoader.load(url, resolve, undefined, reject);
-  });
+/* ------------------------------------------------------------------ *
+ * 加载：fetch（带进度/取消/缓存）→ GLTFLoader.parse
+ *
+ * 为什么不用 `loader.load()`：那条路没有进度回调之外的任何控制——不能取消、
+ * 不能超时、失败重试要自己包，而且每次切换角色都会把 9–24 MB 重新下一遍。
+ * 这里自己抓 ArrayBuffer，换来四件事：
+ *   ① 真进度（按 content-length 算，不是「加载中…」）；
+ *   ② AbortSignal 贯穿（切页/换角色时立刻断掉在途请求）；
+ *   ③ 同一 URL 的内存缓存（换装/来回切角色不重复下载）；
+ *   ④ 超时可控（弱网下不再无限转圈）。
+ * ------------------------------------------------------------------ */
+
+/** Draco 解码器目录（构建时由 `public/decoders/draco/` 提供；只在遇到压缩资产时才下载 wasm） */
+let dracoDecoderPath: string | null = '/decoders/draco/';
+let dracoLoader: DRACOLoader | null = null;
+
+/** 覆盖 Draco 解码器路径；传 null 关闭（不支持压缩资产） */
+export function setDracoDecoderPath(path: string | null) {
+  dracoDecoderPath = path;
+  dracoLoader?.dispose();
+  dracoLoader = null;
 }
+
+export interface LoadProgress {
+  loaded: number;
+  total: number;
+  /** 0–1；服务端没给 content-length 时为 0 */
+  ratio: number;
+}
+
+export interface LoadOptions {
+  signal?: AbortSignal;
+  onProgress?: (p: LoadProgress) => void;
+  /** 毫秒；默认 30000。超时按 AbortError 抛出 */
+  timeoutMs?: number;
+}
+
+/** URL → ArrayBuffer 的进程内缓存（同一页里的换装/回切不再重下） */
+const bufferCache = new Map<string, ArrayBuffer>();
+
+/** 清缓存（编辑器热切换/调试用；正常业务不需要） */
+export function clearAssetCache(url?: string) {
+  if (url) bufferCache.delete(url);
+  else bufferCache.clear();
+}
+
+export function assetCacheStats(): { entries: number; bytes: number } {
+  let bytes = 0;
+  for (const b of bufferCache.values()) bytes += b.byteLength;
+  return { entries: bufferCache.size, bytes };
+}
+
+function concatChunks(chunks: Uint8Array[], size: number): ArrayBuffer {
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.byteLength; }
+  return out.buffer;
+}
+
+/**
+ * 抓一个二进制资源。缓存在**解码成 ArrayBuffer 之后**，所以命中时进度直接 100%：
+ * 这不是「假装在加载」，而是真的不用再走网络。
+ */
+export async function fetchBinary(url: string, opts: LoadOptions = {}): Promise<ArrayBuffer> {
+  const hit = bufferCache.get(url);
+  if (hit) {
+    opts.onProgress?.({ loaded: hit.byteLength, total: hit.byteLength, ratio: 1 });
+    return hit;
+  }
+
+  const timeoutMs = opts.timeoutMs ?? 30000;
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = timeoutMs > 0
+    ? setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs)
+    : null;
+  const onOuterAbort = () => ctrl.abort();
+  opts.signal?.addEventListener('abort', onOuterAbort, { once: true });
+
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
+
+    const total = Number(res.headers.get('content-length')) || 0;
+    const body = res.body;
+    if (!body) {
+      const buf = await res.arrayBuffer();
+      bufferCache.set(url, buf);
+      opts.onProgress?.({ loaded: buf.byteLength, total: buf.byteLength, ratio: 1 });
+      return buf;
+    }
+
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        loaded += value.byteLength;
+        opts.onProgress?.({ loaded, total, ratio: total > 0 ? Math.min(1, loaded / total) : 0 });
+      }
+    }
+    const buf = concatChunks(chunks, loaded);
+    bufferCache.set(url, buf);
+    opts.onProgress?.({ loaded, total: total || loaded, ratio: 1 });
+    return buf;
+  } catch (e) {
+    if (timedOut) throw new Error(`${url}: 加载超时（${timeoutMs} ms）`);
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', onOuterAbort);
+  }
+}
+
+const gltfLoader = new GLTFLoader();
+function loader(): GLTFLoader {
+  if (dracoDecoderPath) {
+    if (!dracoLoader) {
+      dracoLoader = new DRACOLoader();
+      dracoLoader.setDecoderPath(dracoDecoderPath);
+    }
+    gltfLoader.setDRACOLoader(dracoLoader);
+  }
+  return gltfLoader;
+}
+
+/** 以 `/` 开头 = 任意项目内路径；否则按 `/assets/models/<file>` 解析 */
+const assetUrl = (file: string) => (file.startsWith('/') ? file : `/assets/models/${file}`);
+
+async function loadGLB(file: string, opts: LoadOptions = {}): Promise<GLTF> {
+  const url = assetUrl(file);
+  const buf = await fetchBinary(url, opts);
+  // 第二个参数是相对路径前缀：GLB 自包含时它只影响外部贴图/缓冲的解析
+  return loader().parseAsync(buf, url.slice(0, url.lastIndexOf('/') + 1));
+}
+
 
 /** 归一化：缩放到目标高度，脚底贴 y=base */
 function normalizeModel(obj: THREE.Object3D, targetH: number, base = 0): THREE.Group {
@@ -93,7 +225,7 @@ function addLightRig(group: THREE.Group) {
   group.add(rim);
 }
 
-export interface LoadCharacterOptions {
+export interface LoadCharacterOptions extends LoadOptions {
   /** 挂角色光台架（房间用 true；编辑器自带场景灯时传 false） */
   withLights?: boolean;
   /** 覆盖站位（房间机位标定）；省略则用契约档案里的 standPosition */
@@ -112,12 +244,12 @@ export async function loadCharacter(
   id: string,
   opts: LoadCharacterOptions = {},
 ): Promise<CharacterHandles> {
-  const gltf = await loadGLB(charterPath(id));
+  const gltf = await loadGLB(charterPath(id), opts);
   const charter = readModelCharter(gltf.scene);
   if (!charter) {
     throw new Error(
       `${id}: 资产没有契约标注。请确认加载的是 <id>.charter.glb，并先跑 `
-      + `\`node tools/charter-glb.mjs models/${id}.glb\`。`,
+      + `\`node pipeline/charter-glb.mjs assets/models/${id}.glb\`。`,
     );
   }
 
@@ -155,6 +287,47 @@ export async function loadCharacter(
     charter,
     report,
   };
+}
+
+/**
+ * 释放一个角色独占的 GPU 资源：几何 / 材质 / 材质引用的贴图 / group 上的灯光。
+ *
+ * 为什么单独一个函数而不是塞进 `stage.dispose()`：角色是可以**中途换掉**的
+ * （换装、换人、队伍增删），舞台却要一直活着。`character-rendering` 那边的
+ * `dispose()` 只负责 SDF 贴图，GLB 的几何与材质没人管——这就是之前换角色会
+ * 一点点吃显存的原因。
+ *
+ * 不要拿它释放共享材质（`modernMaterials()` 那套单例属于内容层，跨舞台存活）。
+ */
+export function disposeCharacter(handles: CharacterHandles): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+  const textures = new Set<THREE.Texture>();
+
+  handles.group.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh) {
+      if (mesh.geometry) geometries.add(mesh.geometry);
+      const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of list) if (m) materials.add(m);
+    }
+    const light = o as THREE.Light;
+    if (light.isLight) light.dispose?.();
+  });
+
+  for (const m of materials) {
+    // three 的 Material.dispose 不碰贴图，得自己扫一遍属性
+    for (const value of Object.values(m as unknown as Record<string, unknown>)) {
+      const tex = value as THREE.Texture | null;
+      if (tex && (tex as THREE.Texture).isTexture) textures.add(tex);
+    }
+    m.dispose();
+  }
+  for (const t of textures) t.dispose();
+  for (const g of geometries) g.dispose();
+
+  handles.group.removeFromParent();
+  handles.group.clear();
 }
 
 /* ------------------------------------------------------------------ *

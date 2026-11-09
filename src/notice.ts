@@ -30,7 +30,9 @@ export type NoticeCode =
   /** 语义队列带内溢出（offset 超出预留区） */
   | 'queue-overflow'
   /** 模块装在了不该装的材质上（如软粒子装在不透明材质：alpha 没人看，等于白编一段） */
-  | 'material-unsuitable';
+  | 'material-unsuitable'
+  /** 角色没有骨骼契约（rig-manifest 未覆盖该模型）：姿势层不可用，但 GLB clip 仍可播 */
+  | 'rig-missing';
 
 export interface Notice {
   code: NoticeCode;

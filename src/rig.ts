@@ -431,12 +431,37 @@ export class PosePlayer {
   opts: PlayerOptions = {};
   private presets: Record<string, AdditivePreset>;
 
+  /**
+   * 交叉淡化：从「切换那一刻画面上真实的姿势」淡到新姿势。
+   *
+   * 为什么记的是**合成后的姿势**而不是上一个 clip：切换可能发生在
+   * clip → 静态姿势、静态姿势 → clip、clip → clip 三种组合上。只记 clip 的话
+   * 另外两种要么跳变，要么要写三套分支。记一份 PoseDeg 换来三条路共用一套逻辑。
+   */
+  private fadeFrom: PoseDeg | null = null;
+  private fadeT = 0;
+  private fadeDur = 0;
+  /** 上一帧真正写进骨骼的姿势（含叠加层与淡化），`currentPose()` 用它 */
+  private displayed: PoseDeg = {};
+
   constructor(rig: Rig, presets: Record<string, AdditivePreset> = {}) {
     this.rig = rig;
     this.presets = presets;
   }
 
-  play(clip: PoseClip, from = 0) {
+  /** 切换时开始淡化；`0` = 硬切 */
+  beginFade(seconds: number) {
+    this.fadeFrom = this.displayed;
+    this.fadeT = 0;
+    this.fadeDur = Math.max(0, seconds);
+  }
+
+  get fading() {
+    return this.fadeDur > 0;
+  }
+
+  play(clip: PoseClip, from = 0, fade = 0) {
+    if (fade > 0) this.beginFade(fade);
     this.clip = clip;
     this.time = from;
     this.playing = true;
@@ -447,19 +472,21 @@ export class PosePlayer {
   }
 
   /** 切回静态姿势（排单/编辑时用）；停在当前位置不抽动 */
-  setStatic(pose: PoseDeg) {
+  setStatic(pose: PoseDeg, fade = 0) {
+    if (fade > 0) this.beginFade(fade);
     this.basePose = pose;
     this.clip = null;
     this.playing = false;
   }
 
-  /** 当前实际显示的姿势（含叠加层）—— 「加当前姿势」按这个取 */
+  /** 当前实际显示的姿势（含叠加层与淡化）—— 「加当前姿势」按这个取 */
   currentPose(): PoseDeg {
+    if (Object.keys(this.displayed).length) return this.displayed;
     if (!this.clip) return this.basePose ?? {};
     return sampleClip(this.clip, this.time);
   }
 
-  /** 每帧调用：采样 → 叠加 → 写骨 */
+  /** 每帧调用：采样 → 叠加 → 淡化 → 写骨 */
   update(dt: number) {
     const k = this.opts.timeScale ?? 1;
     this.clock += dt * k;
@@ -489,6 +516,18 @@ export class PosePlayer {
       pose = blendAdd(pose, mod);
     }
 
+    if (this.fadeDur > 0 && this.fadeFrom) {
+      this.fadeT = Math.min(this.fadeDur, this.fadeT + dt);
+      const u = this.fadeT / this.fadeDur;
+      pose = lerpPose(this.fadeFrom, pose, u * u * (3 - 2 * u));
+      if (this.fadeT >= this.fadeDur) {
+        this.fadeFrom = null;
+        this.fadeDur = 0;
+        this.fadeT = 0;
+      }
+    }
+
+    this.displayed = pose;
     this.rig.setPose(pose);
   }
 }

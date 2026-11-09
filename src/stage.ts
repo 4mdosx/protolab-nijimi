@@ -1,12 +1,12 @@
 /**
  * 舞台（Stage）—— 引擎的**技术总装**：渲染器 / 灯光 / IBL / NPR / 正交 diorama 相机 /
- * 视窗缩放平移 / 后期（Bloom + 调色）/ 帧循环 / 角色加载。
+ * 视窗缩放平移 / 后期（Bloom + 调色）/ 帧循环 / 角色加载 / 表演运行时 / 镜头调度。
  *
  * ⚠️ 它**不认识任何具体场景**：场景内容由 `pack`（ScenePack，见 src/scenes/types.ts）注入。
  * 引擎自带示例包 `scenes/workshop.ts`；内容侧实现同一接口就能换自己的房间/关卡，
  * 不需要改这个文件（迁移路径见 docs/职责边界.md）。
  *
- * 动画层帧率可配置（房间渲染架构的分层接口，MVP 跑 30fps）：内容动画统一在
+ * 动画层帧率可配置（默认跟画质档位）；内容动画统一在
  * `pack.update(animStep, elapsed)` 里推进，别用真实帧 dt。
  *
  * 2026-10-17（P0 管线修复，见 docs/渲染管线-着色器扩展与钩子系统.md §5）：
@@ -19,11 +19,21 @@
  * 2026-10-17（P3 ⊕ 软粒子）：`softParticles` 选项会在主渲染之前多渲一遍场景深度
  * （`src/depth-prepass.ts`），内容包通过 `ScenePackContext.depth` 拿到它。
  * 这是**场景渲染期**的深度；`post.depthTexture` 是场景渲完之后才有的那个，两者不是一回事。
+ *
+ * 2026-10-19（P0，见 docs/现状评估-放置游戏展示层.md）：
+ *   - **表演运行时**接线：角色加载完按 `rig-manifest` 装配 `Performer`，
+ *     动画步长里更新；`PosePlayer` / `CharacterAnim` 不再只是编辑器里的零件。
+ *   - **多角色**：`addCharacter / removeCharacter`，每个角色独立的 Performer 与释放路径。
+ *   - **画质档位**：`quality` 预设（DPR / 阴影 / MSAA / Bloom 分辨率 / 动画帧率）。
+ *   - **镜头调度**：`shot()` / `shake()`，正交机位下做推拉、摇镜、震屏。
+ *   - `view.zoom` 的 setter 从空实现改成真的生效（之前写进去静默无效）。
  */
 
 import * as THREE from 'three';
-import { loadCharacter, loadProps, type CharacterHandles } from './character';
+import { loadCharacter, loadProps, disposeCharacter, type CharacterHandles, type LoadCharacterOptions } from './character';
 import { prepareCharacterRendering, type CharacterRendering } from './character-rendering';
+import { createPerformer, type Performer } from './performance';
+import { loadRigManifest, type RigManifest } from './rig';
 import { workshopScene } from './scenes/workshop';
 import type { ScenePack } from './scenes/types';
 import {
@@ -46,15 +56,98 @@ import type { ShaderModule } from './shader/module';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
+/** 旧常量：内容包与文档里提到「动画层 30fps」时仍在用。实际步长由画质档位决定。 */
 export const ANIM_FPS = 30;
 /** 慢帧最多补几步动画（防止一次卡顿后连跑十几步雪崩） */
 const MAX_CATCHUP_STEPS = 5;
+/** 单帧真实 dt 的上限：切后台回来、断点调试后恢复时，别让演出/粒子一次跳几秒 */
+const MAX_FRAME_DT = 0.1;
 
 /** 取景：场景任一维不超过视窗的 62%（四周留白给背景） */
 const ROOM_FRAC = 0.62;
 const ZOOM_MIN = 1;
 const ZOOM_MAX = 3.2;
 const ZOOM_DEFAULT = 1.35;
+
+/* ------------------------------------------------------------------ *
+ * 画质档位
+ * ------------------------------------------------------------------ */
+
+export type QualityTier = 'low' | 'mid' | 'high' | 'auto';
+export type ResolvedQuality = Exclude<QualityTier, 'auto'>;
+
+export interface QualityPreset {
+  tier: ResolvedQuality;
+  /** 设备像素比上限 */
+  dprCap: number;
+  /** false = 整条阴影关掉；数字 = 阴影图边长 */
+  shadows: false | number;
+  /** MSAA 采样数（**只在建链时生效**，运行期切档改不了） */
+  msaa: number;
+  /** Bloom 相对画布的分辨率倍率 */
+  bloomScale: number;
+  /** 动画层步长（fps） */
+  animFps: number;
+  /** 深度预 pass 每 N 帧更新一次（软粒子淡出不需要 60Hz） */
+  depthEvery: number;
+}
+
+/**
+ * 三档的取舍，不是「低中高」的机械三等分：
+ *   low  只保「看起来是这个游戏」——关阴影、无 MSAA、DPR 1、Bloom 半分辨率。
+ *   mid  手机主力档：DPR 1.5 + 1024 阴影，画质损失肉眼几乎看不出。
+ *   high 桌面档：DPR 2 + 2048 阴影 + 4×MSAA + 60fps 动画。
+ */
+export const QUALITY_PRESETS: Record<ResolvedQuality, QualityPreset> = {
+  low: { tier: 'low', dprCap: 1, shadows: false, msaa: 0, bloomScale: 0.5, animFps: 20, depthEvery: 2 },
+  mid: { tier: 'mid', dprCap: 1.5, shadows: 1024, msaa: 2, bloomScale: 0.75, animFps: 30, depthEvery: 2 },
+  high: { tier: 'high', dprCap: 2, shadows: 2048, msaa: 4, bloomScale: 1, animFps: 60, depthEvery: 1 },
+};
+
+/** `auto` 的判定：移动端 / 低核数 / 低内存一档一档往下退。 */
+export function detectQualityTier(): ResolvedQuality {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  const ua = navigator.userAgent;
+  const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua)
+    || (navigator.maxTouchPoints > 1 && /Macintosh/i.test(ua));
+  const cores = nav.hardwareConcurrency ?? 4;
+  const mem = nav.deviceMemory ?? 8;
+  if (mobile) return (cores <= 4 || mem <= 4) ? 'low' : 'mid';
+  if (cores <= 4 || mem <= 4) return 'mid';
+  return 'high';
+}
+
+/* ------------------------------------------------------------------ *
+ * 镜头
+ * ------------------------------------------------------------------ */
+
+export interface ShotOptions {
+  /** 目标缩放（1–3.2）；正交机位下这就是「推拉」 */
+  zoom?: number;
+  /** 取景中心（世界坐标）；这是「摇镜」 */
+  target?: readonly [number, number, number];
+  /** 秒，默认 0.8 */
+  duration?: number;
+  /** 到达后保持的秒数，默认 0 */
+  hold?: number;
+  ease?: 'smooth' | 'linear' | 'out';
+  /** 与镜头同时起跑的震屏 */
+  shake?: { amp?: number; freq?: number; decay?: number };
+}
+
+export interface ShotHandle {
+  readonly done: boolean;
+  /** 停在当前位置（不会回到起点） */
+  stop(): void;
+}
+
+export interface StageCharacter {
+  readonly id: string;
+  readonly handles: CharacterHandles;
+  /** 装配失败（无 rig manifest）时为 null */
+  readonly performer: Performer | null;
+  readonly rendering: CharacterRendering | null;
+}
 
 export interface Stage<H = unknown> {
   renderer: THREE.WebGLRenderer;
@@ -73,6 +166,7 @@ export interface Stage<H = unknown> {
   resize(): void;
   /** 视窗 rig：虚拟视窗（box）内缩放 / 平移，窗口本身大小不变 */
   view: {
+    /** 读得到也**写得进**（写入会被 clamp 到 1–3.2 并立即应用） */
     zoom: number;
     /** f > 1 放大；ndc 为缩放锚点（省略则缩放视窗中心） */
     zoomBy(f: number, ndc?: { x: number; y: number }): void;
@@ -100,7 +194,7 @@ export interface Stage<H = unknown> {
   onNotice(listener: (n: Notice) => void): () => void;
   /**
    * 每帧钩子（真实时间，在任何 GPU 工作之前调用）。
-   * 效果时间线、参数驱动放这里——别塞进内容包的 1/30 动画步长。
+   * 效果时间线、参数驱动放这里——别塞进内容包的动画步长。
    */
   onFrame(listener: (ctx: FrameContext) => void): () => void;
   /** 当前帧的只读快照（帧循环外读到的永远是上一帧） */
@@ -109,10 +203,43 @@ export interface Stage<H = unknown> {
   setBloom(on: boolean): void;
   /** NPR 手法开关（终末地复刻子集；默认开，?npr=0 关）。只管材质，不碰后期。 */
   setNpr(on: boolean): void;
-  /** 角色句柄（异步加载，可能为 null） */
-  character(): CharacterHandles | null;
+
+  /* ---------- 角色与表演 ---------- */
+
+  /** 主角色句柄（无参）；传 id 取指定角色。异步加载，可能为 null */
+  character(id?: string): CharacterHandles | null;
   /** SDF 加载状态与角色着色资源；加载完成前为 null。 */
-  characterRendering(): CharacterRendering | null;
+  characterRendering(id?: string): CharacterRendering | null;
+  /**
+   * 表演运行时（主角色）。舞台在角色加载完后按 `rig-manifest` 自动装配；
+   * 没有骨骼契约时 performer 仍然存在（`performer.ready === false`），GLB clip 照常能播。
+   * **它是骨骼的唯一写骨者**——不要再另外 update 一个 PosePlayer。
+   */
+  performer(id?: string): Performer | null;
+  /** 当前全部角色（按加入顺序，第一个是主角色） */
+  characters(): readonly StageCharacter[];
+  /**
+   * 追加一个角色。默认：额外角色不挂光台架（省两盏点光），站位在主角色基础上
+   * 按加入顺序偏移；要精确摆位就传 `position` / `rotY`。
+   */
+  addCharacter(id: string, opts?: LoadCharacterOptions): Promise<StageCharacter | null>;
+  /** 移除并**释放**角色占用的几何 / 材质 / 贴图。返回是否真的移除了 */
+  removeCharacter(id: string): boolean;
+
+  /* ---------- 镜头 ---------- */
+
+  /** 播一个镜头（推拉 / 摇镜 / 震屏）。新镜头会顶掉旧镜头 */
+  shot(opts: ShotOptions): ShotHandle;
+  /** 单独震屏（不影响取景） */
+  shake(amp?: number, duration?: number): void;
+
+  /* ---------- 画质 ---------- */
+
+  /** 当前生效的档位（`auto` 已被解析成具体档） */
+  readonly quality: QualityPreset;
+  /** 运行期切档：DPR / 阴影 / Bloom 分辨率 / 动画步长立即生效；MSAA 只能建链时定 */
+  setQuality(tier: QualityTier): QualityPreset;
+
   /**
    * 世界坐标 → 页面客户端像素（交互层把 3D 端口 / 设备投回 DOM 芯片位置用）。
    * 投影属于渲染职责，所以游戏侧不需要碰相机与矩阵。
@@ -121,7 +248,7 @@ export interface Stage<H = unknown> {
   /** 取 Object3D 的世界坐标 → 页面客户端像素（同上） */
   objectClientPos(obj: THREE.Object3D): { x: number; y: number };
   /**
-   * 释放舞台独占的资源（后期链 / IBL / 渲染器 / 监听 / canvas）。
+   * 释放舞台独占的资源（后期链 / IBL / 渲染器 / 监听 / canvas / **全部角色**）。
    * 场景内容与共享材质单例（`modernMaterials()`）**不在这里释放**：它们跨舞台存活，
    * 由内容层持有。切换编辑器时调用本函数，别只把 DOM 扔掉。
    */
@@ -139,6 +266,7 @@ export interface Stage<H = unknown> {
     params: ParamBus;
     clock: FrameClock;
     depth: DepthPrepass | null;
+    quality: QualityPreset;
   };
 }
 
@@ -168,6 +296,23 @@ export interface StageOptions<H> {
    * `scale` 是深度图相对 canvas 设备像素的倍率（默认 0.5）。
    */
   softParticles?: boolean | { scale?: number };
+  /**
+   * 画质档位，默认 `'high'`（与改造前一致）。**游戏侧建议传 `'auto'`**：
+   * 移动端退到 mid/low，桌面留 high。
+   */
+  quality?: QualityTier;
+  /** 动画层步长（fps）。给了就锁定，不随画质档位变化 */
+  animFps?: number;
+  /**
+   * 主角之外的额外角色。字符串 = 只用默认站位；对象形式可精确摆位。
+   * 额外角色默认不挂角色光台架（省点光），需要就显式 `withLights: true`。
+   */
+  extraCharacters?: readonly (string | {
+    id: string;
+    position?: [number, number, number];
+    rotY?: number;
+    withLights?: boolean;
+  })[];
 }
 
 /** 建舞台。容器尺寸决定视窗，内容包决定「里面有什么」。 */
@@ -183,6 +328,15 @@ export function createStage<H = unknown>(
     characterModules = [],
   } = opts;
 
+  // ---- 画质档位 ----
+  const tierArg: QualityTier = opts.quality ?? 'high';
+  let quality: QualityPreset = QUALITY_PRESETS[tierArg === 'auto' ? detectQualityTier() : tierArg];
+  const animFpsOverride = opts.animFps;
+  let animFps = animFpsOverride ?? quality.animFps;
+  let animStep = 1 / animFps;
+  let depthEvery = quality.depthEvery;
+  let depthFrame = 0;
+
   // 提示通道与参数总线：整条舞台共用一条（材质、后期、内容侧都往这里写）
   const notices = createNoticeSink();
   const params = createParamBus({ notices });
@@ -192,8 +346,8 @@ export function createStage<H = unknown>(
   // 透明渲染：房间是悬浮 diorama，背景交给页面 CSS（桌宠多窗口前置形态）
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
   renderer.setClearColor(0x000000, 0);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.shadowMap.enabled = true;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, quality.dprCap));
+  renderer.shadowMap.enabled = quality.shadows !== false;
   renderer.shadowMap.type = THREE.PCFShadowMap; // r186：PCFSoft 已移除
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -213,8 +367,9 @@ export function createStage<H = unknown>(
   const key = new THREE.DirectionalLight(0xffc890, 1.35);
   key.position.set(-3.5, 5.5, 2.6);
   key.target.position.set(0.3, 0.6, 0.1);
-  key.castShadow = true;
-  key.shadow.mapSize.set(2048, 2048);
+  const shadowSize = quality.shadows === false ? 1024 : quality.shadows;
+  key.castShadow = quality.shadows !== false;
+  key.shadow.mapSize.set(shadowSize, shadowSize);
   key.shadow.camera.left = -7;
   key.shadow.camera.right = 7;
   key.shadow.camera.top = 7;
@@ -287,17 +442,23 @@ export function createStage<H = unknown>(
     target.add(px);
   }
 
+  const clampZoom = (z: number) => THREE.MathUtils.clamp(z, ZOOM_MIN, ZOOM_MAX);
+
   // ---- 虚拟视窗 rig：box 大小恒定，只在 box 内部缩放/平移 ----
   const view: Stage<H>['view'] = {
     get zoom() {
       return zoom;
     },
-    set zoom(_: number) {
-      void _;
+    // 2026-10-19：这里原本是 `set zoom(_) { void _ }`（空实现）。读得到、写不进去，
+    // 是比「没有 setter」更坏的一种 API——调用方以为设成功了。现在写真生效。
+    set zoom(v: number) {
+      zoom = clampZoom(v);
+      if (!shot) clampTarget();
+      applyCamera();
     },
     zoomBy(f: number, ndc?: { x: number; y: number }) {
       const z1 = zoom;
-      const z2 = THREE.MathUtils.clamp(z1 * f, ZOOM_MIN, ZOOM_MAX);
+      const z2 = clampZoom(z1 * f);
       if (z2 === z1) return;
       // 缩放锚点：让锚点下的世界点保持不动（默认视窗中心）
       const nx = ndc ? ndc.x : 0;
@@ -319,6 +480,7 @@ export function createStage<H = unknown>(
     reset() {
       zoom = ZOOM_DEFAULT;
       target.copy(baseTarget);
+      shot = null;
       applyCamera();
     },
   };
@@ -337,48 +499,8 @@ export function createStage<H = unknown>(
     : null;
 
   // ---- 内容包（房间 / 工业簇 / 粒子 / 内容动画都归它）----
-  const animStep = 1 / ANIM_FPS;
   const packInst = pack.build({ scene, animStep, depth, params });
   const content: H = packInst.handles;
-
-  // ---- 角色与陈设（异步加载，失败不阻塞场景；场景编辑器 withCharacter=false 跳过）----
-  let disposed = false;
-  let character: CharacterHandles | null = null;
-  let characterRendering: CharacterRendering | null = null;
-  if (withCharacter) {
-    loadCharacter(characterId)
-      .then(async (c) => {
-        const rendering = await prepareCharacterRendering(c, nprUniforms, {
-          modules: characterModules,
-          notices,
-        });
-        // 舞台可能在等待贴图期间就被销毁（编辑器快速切页）：别把资源挂进已死的舞台
-        if (disposed) { rendering.dispose(); return; }
-        if (nprEnabled) rendering.apply();
-        characterRendering = rendering;
-        character = c;
-        scene.add(c.group);
-      })
-      .catch((e) => { console.warn(`[${characterId}] 加载失败，场景照常`, e); });
-    if (withProps) {
-      loadProps()
-        .then((p) => { if (!disposed) scene.add(p); })
-        .catch(() => { /* 同上 */ });
-    }
-  }
-
-  const raycaster = new THREE.Raycaster();
-
-  /** 世界点 → 页面客户端像素（与 DOM 层对齐的投影，交互层唯一需要的相机知识） */
-  const _pv = new THREE.Vector3();
-  function projectClient(world: THREE.Vector3): { x: number; y: number } {
-    _pv.copy(world).project(camera);
-    const rect = renderer.domElement.getBoundingClientRect();
-    return {
-      x: rect.left + ((_pv.x + 1) / 2) * rect.width,
-      y: rect.top + ((1 - _pv.y) / 2) * rect.height,
-    };
-  }
 
   // ---- 后期链 ----
   // 顺序即语义：RenderPass 出线性 HDR → Bloom → 调色 → OutputPass（色调映射 + sRGB 编码）。
@@ -386,7 +508,7 @@ export function createStage<H = unknown>(
   const post = createPostChain(renderer, {
     width: Math.max(1, container.clientWidth),
     height: Math.max(1, container.clientHeight),
-    samples: 4,
+    samples: quality.msaa,
     type: THREE.HalfFloatType,
     params,
     notices,
@@ -432,12 +554,186 @@ export function createStage<H = unknown>(
   // 用户想每帧抢同一个参数会在 notice 里看到 param-conflict（而不是悄悄被覆盖）。
   const effects = createEffects({ scene, post, params, notices });
 
-  // ---- 尺寸 ----
+  const raycaster = new THREE.Raycaster();
+
+  /** 世界点 → 页面客户端像素（与 DOM 层对齐的投影，交互层唯一需要的相机知识） */
+  const _pv = new THREE.Vector3();
+  function projectClient(world: THREE.Vector3): { x: number; y: number } {
+    _pv.copy(world).project(camera);
+    const rect = renderer.domElement.getBoundingClientRect();
+    return {
+      x: rect.left + ((_pv.x + 1) / 2) * rect.width,
+      y: rect.top + ((1 - _pv.y) / 2) * rect.height,
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 角色槽位（多角色 + 表演运行时 + 释放）
+   * ------------------------------------------------------------------ */
+
+  interface Slot extends StageCharacter {
+    handles: CharacterHandles;
+    performer: Performer | null;
+    rendering: CharacterRendering | null;
+  }
+
+  const slots = new Map<string, Slot>();
+  let disposed = false;
+  let rigManifestLoading: Promise<RigManifest | null> | null = null;
+
+  /** rig manifest 只读一次；读不到就退回「没有骨架契约」（performer 仍可播 GLB clip） */
+  function ensureManifest(): Promise<RigManifest | null> {
+    if (!rigManifestLoading) rigManifestLoading = loadRigManifest();
+    return rigManifestLoading;
+  }
+
+  const primarySlot = (): Slot | null => slots.values().next().value ?? null;
+
+  async function loadSlot(
+    id: string,
+    options: LoadCharacterOptions = {},
+    index = 0,
+  ): Promise<Slot | null> {
+    if (slots.has(id)) return slots.get(id)!;
+
+    const handles = await loadCharacter(id, {
+      ...options,
+      // 主角色挂光台架；额外角色默认不挂（每挂一套就多两盏点光，N 个角色线性涨）
+      withLights: options.withLights ?? index === 0,
+    });
+
+    // 没给位置时，额外角色按加入顺序往 +X 让开，避免三个人站在同一点上
+    if (index > 0 && !options.position) {
+      handles.group.position.x += 0.95 * index;
+      handles.group.position.z += 0.25 * index;
+    }
+
+    const rendering = await prepareCharacterRendering(handles, nprUniforms, {
+      modules: characterModules,
+      notices,
+    });
+
+    // 舞台可能在等待贴图期间就被销毁（编辑器快速切页）：别把资源挂进已死的舞台
+    if (disposed) {
+      rendering.dispose();
+      disposeCharacter(handles);
+      return null;
+    }
+    if (nprEnabled) rendering.apply();
+    scene.add(handles.group);
+
+    const manifest = await ensureManifest();
+    const performer = createPerformer(handles, manifest, {});
+    if (!performer.ready) {
+      notices.warn('rig-missing', `角色「${id}」没有骨骼契约（rig-manifest 未覆盖或未生成），姿势层不可用。`, {
+        id,
+        detail: { hint: 'node pipeline/rig-glb.mjs' },
+      });
+    }
+
+    const slot: Slot = { id, handles, performer, rendering };
+    slots.set(id, slot);
+    return slot;
+  }
+
+  // ---- 主角（异步加载，失败不阻塞场景；场景编辑器 withCharacter=false 跳过）----
+  if (withCharacter) {
+    void loadSlot(characterId, {}, 0).catch((e) => {
+      console.warn(`[${characterId}] 加载失败，场景照常`, e);
+    });
+    if (withProps) {
+      loadProps()
+        .then((p) => { if (!disposed) scene.add(p); })
+        .catch(() => { /* 同上 */ });
+    }
+    // 额外角色：串行加载（避免同时解析 3 个 10MB 级 GLB 把主线程卡住）
+    let i = 1;
+    for (const extra of opts.extraCharacters ?? []) {
+      const cfg = typeof extra === 'string' ? { id: extra } : extra;
+      const index = i++;
+      void loadSlot(cfg.id, {
+        position: cfg.position ? new THREE.Vector3(...cfg.position) : undefined,
+        rotY: cfg.rotY,
+        withLights: cfg.withLights ?? false,
+      }, index).catch((e) => {
+        console.warn(`[${cfg.id}] 额外角色加载失败`, e);
+      });
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 镜头调度
+   * ------------------------------------------------------------------ */
+
+  interface ActiveShot {
+    fromT: THREE.Vector3;
+    toT: THREE.Vector3;
+    fromZ: number;
+    toZ: number;
+    t: number;
+    dur: number;
+    hold: number;
+    wait: number;
+    ease: NonNullable<ShotOptions['ease']>;
+    done: boolean;
+  }
+  let shot: ActiveShot | null = null;
+
+  interface ActiveShake { amp: number; freq: number; decay: number; t: number }
+  let shakeState: ActiveShake | null = null;
+
+  const easeOf = (kind: NonNullable<ShotOptions['ease']>, u: number) => {
+    if (kind === 'linear') return u;
+    if (kind === 'out') return 1 - Math.pow(1 - u, 3);
+    return u * u * (3 - 2 * u);
+  };
+
+  function updateDirector(dt: number) {
+    if (shot) {
+      shot.t += dt;
+      const u = shot.dur > 0 ? Math.min(1, shot.t / shot.dur) : 1;
+      const e = easeOf(shot.ease, u);
+      target.lerpVectors(shot.fromT, shot.toT, e);
+      zoom = shot.fromZ + (shot.toZ - shot.fromZ) * e;
+      if (u >= 1) {
+        shot.wait += dt;
+        if (shot.wait >= shot.hold) {
+          shot.done = true;
+          shot = null;
+        }
+      }
+      applyCamera();
+    }
+
+    if (shakeState) {
+      shakeState.t += dt;
+      const k = shakeState.t / shakeState.decay;
+      if (k >= 1) {
+        shakeState = null;
+      } else {
+        // 二次衰减 + 两个不同频率叠加，避免「规律抖动」像机器在抖
+        const a = shakeState.amp * (1 - k) * (1 - k);
+        const w = shakeState.t * shakeState.freq * Math.PI * 2;
+        camera.position
+          .addScaledVector(axisRight, Math.sin(w) * a)
+          .addScaledVector(axisScreenUp, Math.cos(w * 1.37) * a);
+        camera.lookAt(target);
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 尺寸
+   * ------------------------------------------------------------------ */
   function resize() {
     const w = Math.max(1, container.clientWidth);
     const h = Math.max(1, container.clientHeight);
     renderer.setSize(w, h);
     post.setSize(w, h);
+    // Bloom 单独按档位降分辨率：post.setSize 会把它拉回全尺寸，所以这里再盖一次
+    if (quality.bloomScale !== 1) {
+      bloomPass.setSize(Math.max(1, Math.round(w * quality.bloomScale)), Math.max(1, Math.round(h * quality.bloomScale)));
+    }
     // 这里传的是 **CSS 像素**：depth.setSize 内部会乘 renderer 的 pixelRatio 再乘
     // scale。别在这里先换成设备像素——那会把 DPR 乘两遍，深度图变成全分辨率。
     depth?.setSize(w, h);
@@ -452,7 +748,8 @@ export function createStage<H = unknown>(
     camera.right = visW / 2;
     camera.top = visH / 2;
     camera.bottom = -visH / 2;
-    clampTarget();
+    // 镜头播放中不要被 resize 拽回中心（编辑器分栏拉一下就把推近吃掉了）
+    if (!shot) clampTarget();
     applyCamera();
   }
 
@@ -477,19 +774,29 @@ export function createStage<H = unknown>(
   canvas.addEventListener('webglcontextlost', onContextLost);
   canvas.addEventListener('webglcontextrestored', onContextRestored);
 
+  // 页面不可见时停帧：移动端锁屏/切后台仍在跑 rAF 是最常见的白耗电
+  let hidden = typeof document !== 'undefined' && document.hidden;
+  function onVisibility() {
+    hidden = document.hidden;
+  }
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+
   resize(); // 初始尺寸（post 就绪后）
 
   // ---- 渲染循环（渲染每帧；动画层固定步长）----
   // 三个时间源在这里分工（文档 §3.7）：
   //   frameTime  真实 dt → uTime/uDelta、参数总线、每帧钩子（效果、流光跟手）
-  //   animTime   1/30 累加器 → 内容包 update、表情/骨骼
+  //   animTime   1/animFps 累加器 → 内容包 update、表情、骨骼表演
+  // 没画质档位时 animFps = 30（历史契约）；high 档提到 60，动作才谈得上「细腻」。
   const clock = createFrameClock(renderer, camera);
   const frameHooks = new Set<(ctx: FrameContext) => void>();
   let animAcc = 0;
 
   function render(dt: number, _elapsed: number) {
     if (disposed) return; // 外部 rAF 可能比 dispose 活得久
-    const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
+    if (hidden) return;   // 页面不可见：不推进任何时钟，也不渲染
+    const raw = Number.isFinite(dt) && dt > 0 ? dt : 0;
+    const step = Math.min(raw, MAX_FRAME_DT);
 
     // 帧上下文先落地：内建参数（uTime/uDelta/uResolution/uCamPos…）在任何钩子之前写好
     const ctx = clock.tick(step, {
@@ -506,7 +813,7 @@ export function createStage<H = unknown>(
     }
     effects.update(ctx);
 
-    // 动画层：累加器推进（1/30 是内容动画的契约步长）。
+    // 动画层：累加器推进（步长由画质档位给出）。
     // 旧写法 `if (elapsed - lastAnim >= step) { ...; render() }` 有两个毛病：
     // 渲染被锁在 30fps，且 lastAnim = elapsed 把余数丢掉，慢帧就读作时间跳变。
     animAcc = Math.min(animAcc + step, animStep * MAX_CATCHUP_STEPS);
@@ -515,18 +822,60 @@ export function createStage<H = unknown>(
       animAcc -= animStep;
       steps++;
       clock.addAnim(animStep);
-      // 第二个参数是**动画时钟**（不是 rAF 的 elapsed）——内容包的相位跟着 1/30 走
+      // 第二个参数是**动画时钟**（不是 rAF 的 elapsed）——内容包的相位跟着步长走
       packInst.update?.(animStep, clock.context.animTime);
-      // 表情层与骨骼动画同一时基：慢帧时脸不会比身体先动。
-      // 它与骨架动画写的是不同属性（morphTargetInfluences vs bone.quaternion），无需互斥。
-      character?.expression?.update(animStep);
+      for (const slot of slots.values()) {
+        // 表情与骨骼同一时基：慢帧时脸不会比身体先动。
+        // 两者写的是不同属性（morphTargetInfluences vs bone.quaternion），无需互斥。
+        slot.handles.expression?.update(animStep);
+        // 表演运行时是**唯一写骨者**；没 play 过时它一帧都不动骨架
+        slot.performer?.update(animStep);
+      }
     }
 
-    // 光照 uniform 跟**渲染帧**走，不跟动画步长：拖动/缩放时 rim 与高光不能慢半拍
+    // 镜头跟**渲染帧**走：推拉/震屏不能慢半拍
+    updateDirector(step);
+
+    // 光照 uniform 跟**渲染帧**走：拖动/缩放时 rim 与高光不能慢半拍
     updateNprUniforms(nprUniforms, camera, key);
     // 深度必须在场景渲染之前：软粒子在**材质里**读它，后处理的深度来不及
-    depth?.update();
+    if (depth && (depthEvery <= 1 || depthFrame % depthEvery === 0)) depth.update();
+    depthFrame++;
     post.render(step);
+  }
+
+  function setQuality(tier: QualityTier): QualityPreset {
+    const next = QUALITY_PRESETS[tier === 'auto' ? detectQualityTier() : tier];
+    quality = next;
+
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, next.dprCap));
+    renderer.shadowMap.enabled = next.shadows !== false;
+    key.castShadow = next.shadows !== false;
+    if (next.shadows !== false && key.shadow.mapSize.width !== next.shadows) {
+      key.shadow.mapSize.set(next.shadows, next.shadows);
+      // 换阴影图尺寸必须丢掉旧的 RT，否则 three 会继续用原来那张
+      key.shadow.map?.dispose();
+      key.shadow.map = null;
+    }
+
+    // 显式给过 animFps 的话，切档不动它（那是内容侧的节奏决定，不是画质）
+    animFps = animFpsOverride ?? next.animFps;
+    animStep = 1 / animFps;
+    depthEvery = next.depthEvery;
+
+    // MSAA 只能建链时定，运行期不重建 RT（重建会把 post 里临时插的 pass 全丢掉）
+    resize();
+    return next;
+  }
+
+  function removeCharacter(id: string): boolean {
+    const slot = slots.get(id);
+    if (!slot) return false;
+    slot.performer?.stop({ fade: 0 });
+    slot.rendering?.dispose();
+    disposeCharacter(slot.handles);
+    slots.delete(id);
+    return true;
   }
 
   function dispose() {
@@ -535,11 +884,11 @@ export function createStage<H = unknown>(
     frameHooks.clear();
     resizeObserver?.disconnect();
     window.removeEventListener('resize', resize);
+    document.removeEventListener('visibilitychange', onVisibility);
     canvas.removeEventListener('webglcontextlost', onContextLost);
     canvas.removeEventListener('webglcontextrestored', onContextRestored);
-    // SDF 是舞台加载的，归舞台；角色网格/材质是角色持有者的，别在这里释放
-    // （共享材质单例还会被下一个舞台复用）
-    characterRendering?.dispose();
+    // 角色：几何 / 材质 / 贴图 / 光台架全部释放（之前只释放了 SDF，换角色会漏）
+    for (const id of [...slots.keys()]) removeCharacter(id);
     effects.dispose();
     depth?.dispose();
     env.dispose();
@@ -569,8 +918,62 @@ export function createStage<H = unknown>(
       scene.environmentIntensity = on ? 0.6 : 0;
       // 不碰 gradePass：NPR 是材质层，调色是后期层（耦合会导致「关 NPR」时整张画面换色）
     },
-    character: () => character,
-    characterRendering: () => characterRendering,
+
+    character: (id?: string) => (id ? slots.get(id)?.handles ?? null : primarySlot()?.handles ?? null),
+    characterRendering: (id?: string) => (id ? slots.get(id)?.rendering ?? null : primarySlot()?.rendering ?? null),
+    performer: (id?: string) => (id ? slots.get(id)?.performer ?? null : primarySlot()?.performer ?? null),
+    characters: () => [...slots.values()],
+
+    addCharacter: async (id, loadOpts = {}) => {
+      if (disposed) return null;
+      const existed = slots.get(id);
+      if (existed) return existed;
+      return loadSlot(id, loadOpts, slots.size);
+    },
+    removeCharacter,
+
+    shot(shotOpts: ShotOptions): ShotHandle {
+      const fromT = target.clone();
+      const toT = shotOpts.target ? new THREE.Vector3(...shotOpts.target) : target.clone();
+      const s: ActiveShot = {
+        fromT,
+        toT,
+        fromZ: zoom,
+        toZ: clampZoom(shotOpts.zoom ?? zoom),
+        t: 0,
+        dur: Math.max(0, shotOpts.duration ?? 0.8),
+        hold: Math.max(0, shotOpts.hold ?? 0),
+        wait: 0,
+        ease: shotOpts.ease ?? 'smooth',
+        done: false,
+      };
+      shot = s;
+      if (shotOpts.shake) {
+        shakeState = {
+          amp: shotOpts.shake.amp ?? 0.04,
+          freq: shotOpts.shake.freq ?? 18,
+          decay: shotOpts.shake.decay ?? 0.35,
+          t: 0,
+        };
+      }
+      return {
+        get done() { return s.done; },
+        stop() {
+          s.done = true;
+          if (shot === s) shot = null;
+        },
+      };
+    },
+
+    shake(amp = 0.04, duration = 0.35) {
+      shakeState = { amp, freq: 18, decay: Math.max(0.05, duration), t: 0 };
+    },
+
+    get quality() {
+      return quality;
+    },
+    setQuality,
+
     clientPos: projectClient,
     objectClientPos: (obj: THREE.Object3D) => projectClient(obj.getWorldPosition(new THREE.Vector3())),
     dispose,
@@ -581,6 +984,7 @@ export function createStage<H = unknown>(
       params,
       clock,
       depth,
+      get quality() { return quality; },
     },
   };
 }

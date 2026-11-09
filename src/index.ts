@@ -42,6 +42,7 @@ export * from './character';
 export * from './character-rendering';
 export * from './rig';
 export * from './anim';
+export * from './performance';
 export * from './expression';
 // 表情/指令的对外契约（FROZEN）与 witch.exp/1 指令流
 export * from './exp-contract';
